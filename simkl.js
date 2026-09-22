@@ -288,6 +288,18 @@
         thrown: 'dropped'
     };
 
+    var MENU_ID = 'lampa-simkl-menu';
+    var SCREEN = 'simkl_next';
+
+    // Разделы панели. Пока он один, поэтому пункт меню ведёт прямо в него —
+    // прослойка из единственной строки только добавила бы нажатие.
+    var SECTIONS = [
+        { id: 'next', title: 'Смотреть дальше' }
+    ];
+
+    // Родная заглушка Lampa для картинки, которая не загрузилась
+    var BROKEN_POSTER = './img/img_broken.svg';
+
     var TOKEN_KEY = 'simkl_token';
     var REFRESH_KEY = 'simkl_refresh';
     var EXPIRES_KEY = 'simkl_expires';
@@ -317,6 +329,12 @@
         .simkl-pin__link { margin-top: 0.8em; opacity: 0.75; word-break: break-all; }
         .simkl-pin__link a { color: inherit; }
         .simkl-pin__state { margin-top: 1em; opacity: 0.6; }
+        #lampa-simkl-menu .menu__ico svg { width: 100%; height: 100%; }
+        /* Вместо года в карточке стоит следующая серия с названием, а оно
+           бывает длинным — обрезаем, чтобы ряд не разъезжался. */
+        .simkl-card .card__age {
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
         /* Lampa запрещает выделение на всём приложении — она про пульт. Но код
            и ссылку с мышью хочется скопировать, так что здесь возвращаем. */
         .simkl-pin__code, .simkl-pin__link {
@@ -1037,6 +1055,173 @@
         refresh(ctx);
     }
 
+    // --- Экран «Смотреть дальше» -------------------------------------------
+
+    // Simkl отдаёт свои постеры, и этого достаточно: идти в TMDB за каждой из
+    // сорока карточек ради той же картинки — сорок лишних запросов на экран.
+    // wsrv.nl — рекомендованный самим Simkl прокси, он кеширует и снимает
+    // нагрузку с их CDN.
+    function posterUrl(path) {
+        if (!path) return BROKEN_POSTER;
+        return 'https://wsrv.nl/?url=https://simkl.in/posters/' + path + '_m.jpg&q=90';
+    }
+
+    function episodeLabel(next) {
+        function pad(value) { return value < 10 ? '0' + value : String(value); }
+
+        var code = 'S' + pad(next.season) + 'E' + pad(next.episode);
+        return next.title ? code + ' · ' + next.title : code;
+    }
+
+    // Сначала то, что уже вышло и ждёт просмотра, свежее сверху; потом сериалы,
+    // чья следующая серия ещё не вышла. Иначе анонсы будущих серий оттеснили бы
+    // вниз ровно то, ради чего экран и открывают.
+    function sortByNext(items) {
+        var now = Date.now();
+
+        return items.slice().sort(function (a, b) {
+            var at = Date.parse(a.next_to_watch_info.date) || 0;
+            var bt = Date.parse(b.next_to_watch_info.date) || 0;
+            var a_aired = at <= now;
+            var b_aired = bt <= now;
+
+            if (a_aired !== b_aired) return a_aired ? -1 : 1;
+            return a_aired ? bt - at : at - bt;
+        });
+    }
+
+    function NextScreen() {
+        var scroll = new Lampa.Scroll({ mask: true, over: true, step: 250 });
+        var grid = $('<div class="category-full"></div>');
+        var self = this;
+
+        function finish() {
+            if (self.activity) {
+                self.activity.loader(false);
+                self.activity.toggle();
+            }
+        }
+
+        function message(text) {
+            grid.remove();
+            scroll.append(new Lampa.Empty({ descr: text }).render());
+            finish();
+        }
+
+        function build(item) {
+            var show = item.show;
+            var next = item.next_to_watch_info;
+            var tmdb = Number(show.ids && show.ids.tmdb);
+
+            var card = Lampa.Template.get('card', { title: show.title, release_year: show.year || '' });
+            var img = card.find('.card__img')[0];
+
+            card.addClass('simkl-card');
+            card.find('.card__age').text(episodeLabel(next));
+
+            img.onload = function () { card.addClass('card--loaded'); };
+            img.onerror = function () { img.src = BROKEN_POSTER; };
+            img.src = posterUrl(show.poster);
+
+            // Дальше карточку ведёт сама Lampa: открываем её обычным способом
+            // по tmdb-id, и всё остальное — сезоны, кнопки, другие плагины —
+            // работает ровно как на любой другой карточке.
+            card.on('hover:enter', function () {
+                if (!tmdb) return Lampa.Noty.show('Simkl: у тайтла нет id TMDB');
+
+                Lampa.Activity.push({
+                    component: 'full',
+                    id: tmdb,
+                    method: 'tv',
+                    source: 'tmdb',
+                    title: show.title,
+                    card: { id: tmdb, name: show.title, source: 'tmdb' }
+                });
+            });
+
+            return card;
+        }
+
+        function load() {
+            if (!configured()) return message('Simkl: не задан client_id');
+            if (!token()) return message('Подключите аккаунт Simkl в настройках');
+
+            api({
+                path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
+                auth: true,
+                onDone: function (data) {
+                    var items = ((data && data.shows) || []).filter(function (item) {
+                        return item && item.show && item.next_to_watch_info;
+                    });
+
+                    if (!items.length) return message('Нечего смотреть дальше: новых серий нет');
+
+                    sortByNext(items).forEach(function (item) { grid.append(build(item)); });
+                    finish();
+                },
+                onFail: function () {
+                    message('Не удалось получить список Simkl');
+                }
+            });
+        }
+
+        this.create = function () {
+            scroll.append(grid);
+            if (this.activity) this.activity.loader(true);
+            load();
+            return this.render();
+        };
+
+        this.start = function () {
+            Lampa.Controller.add('content', {
+                toggle: function () {
+                    Lampa.Controller.collectionSet(scroll.render());
+                    Lampa.Controller.collectionFocus(false, scroll.render());
+                },
+                up: function () {
+                    if (Navigator.canmove('up')) Navigator.move('up');
+                    else Lampa.Controller.toggle('head');
+                },
+                down: function () { Navigator.move('down'); },
+                right: function () { Navigator.move('right'); },
+                left: function () {
+                    if (Navigator.canmove('left')) Navigator.move('left');
+                    else Lampa.Controller.toggle('menu');
+                },
+                back: function () { Lampa.Activity.backward(); }
+            });
+            Lampa.Controller.toggle('content');
+        };
+
+        this.render = function () { return scroll.render(); };
+        this.pause = function () {};
+        this.stop = function () {};
+        this.destroy = function () {
+            scroll.destroy();
+            grid.remove();
+        };
+    }
+
+    function addMenuItem() {
+        var list = document.querySelector('.menu .menu__list');
+        if (!list || document.getElementById(MENU_ID)) return;
+
+        var item = $(
+            '<li class="menu__item selector" id="' + MENU_ID + '">' +
+            '<div class="menu__ico">' + ICON + '</div>' +
+            '<div class="menu__text">Simkl</div>' +
+            '</li>'
+        );
+
+        // hover:enter покрывает и пульт, и мышь: вешать сюда ещё и click —
+        // значит открыть экран дважды
+        item.on('hover:enter', function () {
+            Lampa.Activity.push({ component: SCREEN, title: SECTIONS[0].title });
+        });
+
+        $(list).append(item);
+    }
+
     // --- Настройки -------------------------------------------------------
 
     // Строку состояния у кнопки приходится держать самим: Lampa рисует
@@ -1105,6 +1290,12 @@
         if (!configured()) {
             console.warn('Simkl: не задан CLIENT_ID, плагин ничего не покажет');
         }
+
+        Lampa.Component.add(SCREEN, NextScreen);
+
+        // Lampa перерисовывает меню на старте и при смене профиля
+        addMenuItem();
+        setInterval(addMenuItem, 1000);
 
         Core.onFullCard(onCard);
         followFavorite();

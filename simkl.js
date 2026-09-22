@@ -294,10 +294,16 @@
     // он берёт данные через Lampa.Api.list, а тот диспатчится по source.
     var SOURCE = 'simkl';
 
-    // Разделы панели. Пока он один, поэтому пункт меню ведёт прямо в него —
-    // прослойка из единственной строки только добавила бы нажатие.
+    // Разделы панели — по образцу Trakt. «Рекомендаций» нет: персональных
+    // рекомендаций у Simkl в API нет вовсе, а тип списка recommendation — это
+    // списки, которые пользователь собрал сам, они и так попадают в «Мои».
+    // «Понравившимся спискам» Trakt у Simkl соответствуют отслеживаемые.
     var SECTIONS = [
-        { id: 'next', title: 'Смотреть дальше' }
+        { id: 'next', title: 'Смотреть дальше' },
+        { id: 'plan', title: 'Буду смотреть' },
+        { id: 'calendar', title: 'Календарь' },
+        { id: 'lists', title: 'Мои списки', lists: true },
+        { id: 'followed', title: 'Отслеживаемые списки', lists: true }
     ];
 
     var TOKEN_KEY = 'simkl_token';
@@ -739,6 +745,10 @@
 
         dropCache(key);
         delete episodes_cache[key];
+
+        // Отметка сдвигает «Смотреть дальше», смена статуса — «Буду смотреть»,
+        // так что собранные разделы после любой записи уже неверны
+        entries_cache = {};
     }
 
     // «из 8 серий», но «из 21 серии» — после числительного идёт родительный,
@@ -882,22 +892,79 @@
         return 'S' + pad(place.season) + 'E' + pad(place.episode);
     }
 
-    // Первая вышедшая, но не отмеченная серия. Именно её отмечают чаще всего,
-    // поэтому она выносится в меню отдельным пунктом — в одно нажатие.
-    function nextEpisode(status) {
-        var seasons = (status && status.seasons) || [];
+    // Вышедшие, но не отмеченные серии по порядку. Невышедшие в список не
+    // попадают — посмотреть их нельзя, — просмотренные тоже: их и так видно.
+    function unwatchedEpisodes(status) {
+        var list = [];
 
-        for (var i = 0; i < seasons.length; i++) {
-            var episodes = seasons[i].episodes || [];
-
-            for (var j = 0; j < episodes.length; j++) {
-                if (episodes[j].aired && !episodes[j].watched) {
-                    return { season: seasons[i].number, episode: episodes[j].number };
+        ((status && status.seasons) || []).forEach(function (season) {
+            (season.episodes || []).forEach(function (episode) {
+                if (episode.aired && !episode.watched) {
+                    list.push({ season: season.number, episode: episode.number });
                 }
-            }
-        }
+            });
+        });
 
-        return null;
+        return list;
+    }
+
+    function episodesNominative(count) {
+        var n = count % 100;
+        var n1 = n % 10;
+
+        if (n > 10 && n < 20) return 'серий';
+        if (n1 === 1) return 'серия';
+        if (n1 > 1 && n1 < 5) return 'серии';
+        return 'серий';
+    }
+
+    // Выбранная серия отмечается вместе со всеми непросмотренными до неё:
+    // досмотрел до S02E05 — значит, и всё раньше тоже. Уже отмеченные повторно
+    // не шлём, иначе Simkl засчитал бы их пересмотром.
+    function markUpTo(ctx, unwatched, index) {
+        var by_season = {};
+        var order = [];
+
+        unwatched.slice(0, index + 1).forEach(function (place) {
+            if (!by_season[place.season]) {
+                by_season[place.season] = [];
+                order.push(place.season);
+            }
+            by_season[place.season].push({ number: place.episode });
+        });
+
+        var count = index + 1;
+
+        sendHistory(ctx, {
+            seasons: order.map(function (number) {
+                return { number: number, episodes: by_season[number] };
+            })
+        }, 'отмечено до ' + episodeCode(unwatched[index]) +
+            (count > 1 ? ' (' + count + ' ' + episodesNominative(count) + ')' : ''));
+    }
+
+    function openUnwatchedMenu(ctx, unwatched, back) {
+        Lampa.Select.show({
+            title: 'Просмотрено по серию',
+            items: unwatched.map(function (place, index) {
+                var count = index + 1;
+
+                return {
+                    title: episodeCode(place),
+                    // Сразу видно, сколько уйдёт одним нажатием: промах на
+                    // пульте иначе незаметно отметил бы полсезона
+                    subtitle: count === 1
+                        ? 'только эта серия'
+                        : 'отметится ' + count + ' ' + episodesNominative(count),
+                    index: index
+                };
+            }),
+            onSelect: function (chosen) {
+                Lampa.Controller.toggle(back);
+                markUpTo(ctx, unwatched, chosen.index);
+            },
+            onBack: function () { Lampa.Controller.toggle(back); }
+        });
     }
 
     function openSeasonMenu(ctx, status, back) {
@@ -940,10 +1007,16 @@
         var back = Lampa.Controller.enabled().name;
 
         fetchEpisodes(ctx, function (status) {
-            var next = nextEpisode(status);
+            var unwatched = unwatchedEpisodes(status);
             var items = [];
 
-            if (next) items.push({ title: 'Отметить ' + episodeCode(next), mark: next });
+            if (unwatched.length) {
+                items.push({
+                    title: 'Отметить серию…',
+                    subtitle: 'следующая — ' + episodeCode(unwatched[0]),
+                    episodes: true
+                });
+            }
 
             items.push({ title: 'Сезон целиком…', seasons: true });
             items.push({ title: 'Весь сериал просмотрен', whole: true });
@@ -953,17 +1026,12 @@
                 title: 'Simkl',
                 items: items,
                 onSelect: function (chosen) {
+                    if (chosen.episodes) return openUnwatchedMenu(ctx, unwatched, back);
                     if (chosen.seasons) return openSeasonMenu(ctx, status, back);
 
                     Lampa.Controller.toggle(back);
 
                     if (chosen.open) return openOnSimkl(ctx);
-
-                    if (chosen.mark) {
-                        return sendHistory(ctx, {
-                            seasons: [{ number: chosen.mark.season, episodes: [{ number: chosen.mark.episode }] }]
-                        }, 'отмечено ' + episodeCode(chosen.mark));
-                    }
 
                     if (chosen.whole) {
                         sendHistory(ctx, { status: 'completed' }, 'сериал отмечен просмотренным');
@@ -1162,13 +1230,264 @@
         }
     }
 
-    // --- Экран «Смотреть дальше» -------------------------------------------
+    // --- Панель Simkl: разделы ------------------------------------------------
+
+    // Одна страница грида. Карточки TMDB берутся только для неё, так что список
+    // на пятьсот тайтлов стоит двадцати запросов, а не пятисот.
+    var PAGE_SIZE = 20;
+
+    // Список раздела собирается целиком и держится в памяти: листание страниц
+    // не должно каждый раз заново ходить в Simkl.
+    var ENTRIES_TTL = 5 * 60 * 1000;
+    var entries_cache = {};
+
+    // Календарь — общий файл на всех: пересобирается раз в шесть часов и весит
+    // пару мегабайт. В Storage такой не положить, в памяти держим три часа.
+    var CALENDAR_URL = 'https://data.simkl.in/calendar/v2/tv.json';
+    var CALENDAR_TTL = 3 * 60 * 60 * 1000;
+    var calendar_cache = null;
+
+    var user_id = null;
 
     function episodeLabel(next) {
+        var code = episodeCode(next);
+        return next.title ? code + ' · ' + next.title : code;
+    }
+
+    function shortDate(time) {
+        var date = new Date(time);
+
         function pad(value) { return value < 10 ? '0' + value : String(value); }
 
-        var code = 'S' + pad(next.season) + 'E' + pad(next.episode);
-        return next.title ? code + ' · ' + next.title : code;
+        return pad(date.getDate()) + '.' + pad(date.getMonth() + 1);
+    }
+
+    function itemsWord(count) {
+        var n = count % 100;
+        var n1 = n % 10;
+
+        if (n > 10 && n < 20) return 'тайтлов';
+        if (n1 === 1) return 'тайтл';
+        if (n1 > 1 && n1 < 5) return 'тайтла';
+        return 'тайтлов';
+    }
+
+    // Запись раздела: что открыть и что подписать под постером. Без tmdb-id
+    // карточку не собрать, такие записи просто выпадают.
+    function entry(method, ids, label) {
+        var tmdb = Number(ids && ids.tmdb);
+        return tmdb ? { method: method, tmdb: tmdb, label: label } : null;
+    }
+
+    function loadNext(done, fail) {
+        api({
+            path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
+            auth: true,
+            onDone: function (data) {
+                var items = ((data && data.shows) || []).filter(function (item) {
+                    return item && item.show && item.next_to_watch_info;
+                });
+
+                done(sortByNext(items).map(function (item) {
+                    return entry('tv', item.show.ids, episodeLabel(item.next_to_watch_info));
+                }));
+            },
+            onFail: fail
+        });
+    }
+
+    // Аналог Watchlist у Trakt. Фильмы и сериалы лежат у Simkl в разных
+    // корзинах — забираем обе и сводим по дате добавления, свежее сверху.
+    function loadPlan(done, fail) {
+        var parts = {};
+        var failed_once = false;
+
+        ['shows', 'movies'].forEach(function (type) {
+            api({
+                path: '/sync/all-items/' + type + '/plantowatch?extended=full',
+                auth: true,
+                onDone: function (data) {
+                    parts[type] = (data && data[type]) || [];
+                    merge();
+                },
+                onFail: function () {
+                    if (failed_once) return;
+                    failed_once = true;
+                    fail();
+                }
+            });
+        });
+
+        function merge() {
+            if (failed_once || !parts.shows || !parts.movies) return;
+
+            var items = parts.shows.map(function (item) {
+                return { at: item.added_to_watchlist_at, entry: entry('tv', item.show && item.show.ids) };
+            }).concat(parts.movies.map(function (item) {
+                return { at: item.added_to_watchlist_at, entry: entry('movie', item.movie && item.movie.ids) };
+            }));
+
+            items.sort(function (a, b) {
+                return (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0);
+            });
+
+            done(items.map(function (item) { return item.entry; }));
+        }
+    }
+
+    function fetchCalendar(done, fail) {
+        if (calendar_cache && Date.now() - calendar_cache.at < CALENDAR_TTL) {
+            return done(calendar_cache.data);
+        }
+
+        // Файл лежит на CDN, а не в API: токен не нужен, но client_id и имя
+        // приложения Simkl просит и здесь.
+        Core.request({
+            url: CALENDAR_URL + '?client_id=' + encodeURIComponent(CLIENT_ID) +
+                '&app-name=' + encodeURIComponent(APP_NAME) +
+                '&app-version=' + encodeURIComponent(APP_VERSION),
+            timeout: 30000,
+            onDone: function (data) {
+                if (!data || !data.calendar) return fail();
+
+                calendar_cache = { at: Date.now(), data: data };
+                done(data);
+            },
+            onFail: fail
+        });
+    }
+
+    // Персонального календаря у Simkl нет — есть общий файл на ~5 недель
+    // вперёд. Пересекаем его со своими сериалами и берём по одной, ближайшей,
+    // серии на сериал.
+    function loadCalendar(done, fail) {
+        var mine = null;
+        var calendar = null;
+        var failed_once = false;
+
+        function stop() {
+            if (failed_once) return;
+            failed_once = true;
+            fail();
+        }
+
+        // Все сериалы разом, без разбивки по статусам: один запрос вместо пяти
+        api({
+            path: '/sync/all-items/shows',
+            auth: true,
+            onDone: function (data) {
+                mine = {};
+
+                ((data && data.shows) || []).forEach(function (item) {
+                    // Брошенное в календарь не тащим: человек от него отказался сам
+                    if (item.status === 'dropped') return;
+
+                    var id = item.show && item.show.ids && item.show.ids.simkl;
+                    if (id) mine[id] = true;
+                });
+
+                join();
+            },
+            onFail: stop
+        });
+
+        fetchCalendar(function (data) {
+            calendar = data;
+            join();
+        }, stop);
+
+        function join() {
+            if (failed_once || !mine || !calendar) return;
+
+            var now = Date.now();
+            var nearest = {};
+
+            calendar.calendar.forEach(function (item) {
+                if (!mine[item.simkl_id] || !item.episode) return;
+
+                var at = Date.parse(item.date) || 0;
+                if (at < now) return;
+
+                if (!nearest[item.simkl_id] || at < nearest[item.simkl_id].at) {
+                    nearest[item.simkl_id] = { at: at, item: item };
+                }
+            });
+
+            var list = Object.keys(nearest).map(function (id) { return nearest[id]; });
+            list.sort(function (a, b) { return a.at - b.at; });
+
+            done(list.map(function (found) {
+                var meta = calendar.metadata[found.item.simkl_id] || {};
+                return entry('tv', meta.ids, episodeCode(found.item.episode) + ' · ' + shortDate(found.at));
+            }));
+        }
+    }
+
+    function fetchUserId(done, fail) {
+        if (user_id) return done(user_id);
+
+        api({
+            path: '/users/settings',
+            method: 'POST',
+            auth: true,
+            onDone: function (data) {
+                user_id = data && data.account && data.account.id;
+
+                if (user_id) done(user_id);
+                else fail();
+            },
+            onFail: fail
+        });
+    }
+
+    // Бесплатный аккаунт по документации вместо списков получает 200 с полем
+    // error и одной карточкой-заглушкой «купите PRO». Статус тут ничего не
+    // говорит — смотреть надо на само поле.
+    function fetchLists(followed, done, fail) {
+        fetchUserId(function (id) {
+            api({
+                path: '/lists/user/' + id + '?limit=100' + (followed ? '&followed=true' : ''),
+                auth: true,
+                onDone: function (data) {
+                    if (data && data.error) return fail(data.error);
+                    done((data && data.lists) || []);
+                },
+                onFail: function () { fail(); }
+            });
+        }, fail);
+    }
+
+    function loadList(id, done, fail) {
+        api({
+            path: '/lists/' + encodeURIComponent(id) + '?limit=500',
+            auth: true,
+            onDone: function (data) {
+                if (data && data.error) return fail();
+
+                done(((data && data.items) || []).map(function (item) {
+                    return entry(item.type === 'movie' ? 'movie' : 'tv', item.ids);
+                }));
+            },
+            onFail: fail
+        });
+    }
+
+    function loadEntries(url, done, fail) {
+        var hit = entries_cache[url];
+        if (hit && Date.now() - hit.at < ENTRIES_TTL) return done(hit.entries);
+
+        function store(list) {
+            var clean = list.filter(Boolean);
+            entries_cache[url] = { at: Date.now(), entries: clean };
+            done(clean);
+        }
+
+        if (url === 'next') return loadNext(store, fail);
+        if (url === 'plan') return loadPlan(store, fail);
+        if (url === 'calendar') return loadCalendar(store, fail);
+        if (String(url).indexOf('list:') === 0) return loadList(url.slice(5), store, fail);
+
+        fail();
     }
 
     // Сначала то, что уже вышло и ждёт просмотра, свежее сверху; потом сериалы,
@@ -1188,11 +1507,12 @@
         });
     }
 
-    // Подпись со следующей серией — единственное, чего нет у родной карточки:
-    // под постером она показывает год, и пересчитывает его сама, так что
-    // подсунуть текст через данные нельзя. Держим подписи отдельно и
-    // проставляем их после отрисовки, находя карточку по её же card_data.
-    var next_labels = {};
+    // Подпись под постером — единственное, чего нет у родной карточки: там
+    // стоит год, и пересчитывает его она сама, так что подсунуть текст через
+    // данные нельзя. Держим подписи отдельно, по разделам — у одного сериала
+    // в «Смотреть дальше» и в календаре они разные, — и проставляем после
+    // отрисовки, находя карточку по её же card_data.
+    var labels = {};
 
     // Данные приезжают уже после того, как активность отрисовалась, поэтому
     // одного события мало: проставляем и по нему, и сразу после отдачи
@@ -1206,9 +1526,12 @@
         var active = Lampa.Activity.active();
         if (!active || active.source !== SOURCE || !active.activity) return;
 
+        var section = labels[active.url];
+        if (!section) return;
+
         active.activity.render().find('.card').each(function () {
             var data = this.card_data;
-            var label = data && next_labels[data.id];
+            var label = data && section[data.id];
 
             if (label) $(this).addClass('simkl-card').find('.card__age').text(label);
         });
@@ -1216,59 +1539,111 @@
 
     // Источник для родного category_full. Всё, что ему нужно, — метод list;
     // остальное наследуем от tmdb, чтобы карточка, открытая из грида, ходила
-    // за деталями и сезонами ровно туда же, куда и всегда.
+    // за деталями и сезонами ровно туда же, куда и всегда. Раздел приходит в
+    // url активности, страница — в page: следующие страницы грид запрашивает
+    // сам, когда до них докручивают.
     function buildSource() {
         return Object.assign({}, Lampa.Api.sources.tmdb, {
             list: function (params, oncomplite, onerror) {
                 if (!configured() || !token()) return onerror();
 
-                api({
-                    path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
-                    auth: true,
-                    onDone: function (data) {
-                        var items = ((data && data.shows) || []).filter(function (item) {
-                            return item && item.show && item.next_to_watch_info &&
-                                item.show.ids && item.show.ids.tmdb;
+                var url = params.url;
+                var page = Number(params.page) || 1;
+
+                loadEntries(url, function (entries) {
+                    var slice = entries.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+                    if (!slice.length) return onerror();
+
+                    collect(url, slice, function (results) {
+                        oncomplite({
+                            results: results,
+                            page: page,
+                            total_pages: Math.ceil(entries.length / PAGE_SIZE)
                         });
-
-                        if (!items.length) return onerror();
-
-                        collect(sortByNext(items), oncomplite, onerror);
-                    },
-                    onFail: onerror
-                });
+                        scheduleLabels();
+                    }, onerror);
+                }, onerror);
             }
         });
     }
 
     // Родному гриду нужны карточки TMDB, а Simkl отдаёт только свои id и
     // английские названия. Собираем карточки по id — очередью, чтобы не
-    // выстрелить сорока запросами разом.
-    function collect(items, oncomplite, onerror) {
+    // выстрелить двадцатью запросами разом.
+    function collect(url, slice, done, fail) {
         var results = [];
-        var waiting = items.length;
+        var waiting = slice.length;
+        var section = labels[url] || (labels[url] = {});
 
-        next_labels = {};
-
-        items.forEach(function (item, index) {
-            var id = Number(item.show.ids.tmdb);
-
-            tmdbCard('tv', id, function (card) {
+        slice.forEach(function (item, index) {
+            tmdbCard(item.method, item.tmdb, function (card) {
                 // Порядок важен — он и есть сортировка, — поэтому кладём по
                 // индексу, а не по мере возвращения ответов.
                 if (card) {
                     results[index] = card;
-                    next_labels[card.id] = episodeLabel(item.next_to_watch_info);
+                    if (item.label) section[card.id] = item.label;
                 }
 
                 if (--waiting) return;
 
                 var ready_list = results.filter(Boolean);
-                if (!ready_list.length) return onerror();
-
-                oncomplite({ results: ready_list, total_pages: 1, page: 1 });
-                scheduleLabels();
+                if (ready_list.length) done(ready_list);
+                else fail();
             });
+        });
+    }
+
+    function openSection(url, title) {
+        Lampa.Activity.push({ component: 'category_full', source: SOURCE, url: url, title: title, page: 1 });
+    }
+
+    function openLists(section, back) {
+        var followed = section.id === 'followed';
+
+        fetchLists(followed, function (lists) {
+            if (!lists.length) {
+                Lampa.Controller.toggle(back);
+                return Lampa.Noty.show(followed
+                    ? 'Simkl: отслеживаемых списков нет'
+                    : 'Simkl: своих списков нет');
+            }
+
+            Lampa.Select.show({
+                title: section.title,
+                items: lists.map(function (list) {
+                    var count = (list.counts && list.counts.items) || 0;
+                    return { title: list.name, subtitle: count + ' ' + itemsWord(count), id: list.id };
+                }),
+                onSelect: function (chosen) { openSection('list:' + chosen.id, chosen.title); },
+                onBack: function () { Lampa.Controller.toggle(back); }
+            });
+        }, function (reason) {
+            Lampa.Controller.toggle(back);
+            Lampa.Noty.show(reason === 'premium_only'
+                ? 'Simkl: списки доступны только с PRO или VIP'
+                : 'Simkl: не удалось получить списки');
+        });
+    }
+
+    function openPanel() {
+        if (!configured()) return Lampa.Noty.show('Simkl: не задан client_id');
+
+        // После подключения панель сама не открывается: она перехватила бы
+        // фокус, пока человек ещё дожимает подтверждение на телефоне.
+        if (!token()) return startPinAuth();
+
+        var back = Lampa.Controller.enabled().name;
+
+        Lampa.Select.show({
+            title: 'Simkl',
+            items: SECTIONS.map(function (section) {
+                return { title: section.title, section: section };
+            }),
+            onSelect: function (chosen) {
+                if (chosen.section.lists) return openLists(chosen.section, back);
+                openSection(chosen.section.id, chosen.section.title);
+            },
+            onBack: function () { Lampa.Controller.toggle(back); }
         });
     }
 
@@ -1285,15 +1660,7 @@
 
         // hover:enter покрывает и пульт, и мышь: вешать сюда ещё и click —
         // значит открыть экран дважды
-        item.on('hover:enter', function () {
-            Lampa.Activity.push({
-                component: 'category_full',
-                source: SOURCE,
-                url: SECTIONS[0].id,
-                title: SECTIONS[0].title,
-                page: 1
-            });
-        });
+        item.on('hover:enter', openPanel);
 
         $(list).append(item);
     }

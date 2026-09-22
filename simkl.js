@@ -289,7 +289,10 @@
     };
 
     var MENU_ID = 'lampa-simkl-menu';
-    var SCREEN = 'simkl_next';
+
+    // Имя своего источника для Lampa.Api. Грид рисует родной category_full,
+    // он берёт данные через Lampa.Api.list, а тот диспатчится по source.
+    var SOURCE = 'simkl';
 
     // Разделы панели. Пока он один, поэтому пункт меню ведёт прямо в него —
     // прослойка из единственной строки только добавила бы нажатие.
@@ -297,14 +300,11 @@
         { id: 'next', title: 'Смотреть дальше' }
     ];
 
-    // Родная заглушка Lampa для картинки, которая не загрузилась
-    var BROKEN_POSTER = './img/img_broken.svg';
-
     var TOKEN_KEY = 'simkl_token';
     var REFRESH_KEY = 'simkl_refresh';
     var EXPIRES_KEY = 'simkl_expires';
     var CACHE_KEY = 'simkl_status_cache';
-    var TITLES_KEY = 'simkl_titles';
+    var CARDS_KEY = 'simkl_cards';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -1056,62 +1056,84 @@
         refresh(ctx);
     }
 
-    // --- Локальные названия ------------------------------------------------
+    // --- Карточки TMDB -----------------------------------------------------
 
-    // Simkl держит русские названия в поиске — «Игра престолов» находится, — но
-    // наружу отдаёт только английские: language принимает единственное значение
-    // en, а language/locale/title_language на детальных эндпоинтах молча
-    // игнорируются. Поэтому название берём из TMDB по тому же id.
+    // Грид рисует сама Lampa, и ей нужны карточки TMDB — с ними бесплатно
+    // приезжают постер, оценка, бейдж типа и русское название.
     //
-    // Названия не меняются, так что кэш вечный: платим запросами один раз, при
-    // следующем открытии экрана он уже собран.
-    var titles = {};
-    var title_queue = [];
-    var title_active = 0;
+    // Русское название, кстати, из Simkl не достать: в поиске оно у него есть
+    // («Игра престолов» находится), но наружу отдаются только английские —
+    // language принимает единственное значение en, а language, locale и
+    // title_language на детальных эндпоинтах молча игнорируются.
+    //
+    // Данные карточки не меняются, так что кэш вечный: платим запросами один
+    // раз, при следующем открытии экрана он уже собран.
+    var cards = {};
+    var card_queue = [];
+    var card_active = 0;
 
     // Три запроса разом: сорок параллельных телевизор не обрадуют, а по одному
     // экран собирался бы заметно долго.
-    var TITLE_WORKERS = 3;
+    var CARD_WORKERS = 3;
 
-    function loadTitles() {
+    function loadCards() {
         try {
-            titles = Lampa.Storage.get(TITLES_KEY, '{}') || {};
+            cards = Lampa.Storage.get(CARDS_KEY, '{}') || {};
         } catch (e) {
-            console.error('Simkl: не удалось прочитать кэш названий', e);
+            console.error('Simkl: не удалось прочитать кэш карточек', e);
         }
     }
 
-    // Язык входит в ключ: со сменой языка Lampa кэш не должен отдавать
-    // название, набранное для прошлого.
-    function titleKey(method, id) {
+    // Язык входит в ключ: после смены языка Lampa кэш не должен отдавать
+    // карточку, набранную для прошлого.
+    function cardKey(method, id) {
         return Lampa.Storage.get('language', 'ru') + ':' + method + ':' + id;
     }
 
-    function localTitle(method, id, callback) {
-        var key = titleKey(method, id);
-
-        if (titles[key]) return callback(titles[key]);
-
-        title_queue.push({ key: key, method: method, id: id, done: callback });
-        pumpTitles();
+    // В Storage кладём только то, из чего Lampa собирает карточку: полный
+    // ответ TMDB с описанием и сезонами раздул бы хранилище на ровном месте.
+    function trim(data, method) {
+        return {
+            id: data.id,
+            name: data.name,
+            title: data.title,
+            original_name: data.original_name,
+            original_title: data.original_title,
+            poster_path: data.poster_path,
+            backdrop_path: data.backdrop_path,
+            first_air_date: data.first_air_date,
+            release_date: data.release_date,
+            vote_average: data.vote_average,
+            source: 'tmdb',
+            media_type: method
+        };
     }
 
-    function pumpTitles() {
-        if (!title_active && !title_queue.length) {
+    function tmdbCard(method, id, callback) {
+        var key = cardKey(method, id);
+
+        if (cards[key]) return callback(cards[key]);
+
+        card_queue.push({ key: key, method: method, id: id, done: callback });
+        pumpCards();
+    }
+
+    function pumpCards() {
+        if (!card_active && !card_queue.length) {
             try {
-                Lampa.Storage.set(TITLES_KEY, titles);
+                Lampa.Storage.set(CARDS_KEY, cards);
             } catch (e) {
-                console.error('Simkl: не удалось записать кэш названий', e);
+                console.error('Simkl: не удалось записать кэш карточек', e);
             }
             return;
         }
 
-        while (title_active < TITLE_WORKERS && title_queue.length) {
-            run(title_queue.shift());
+        while (card_active < CARD_WORKERS && card_queue.length) {
+            run(card_queue.shift());
         }
 
         function run(task) {
-            title_active++;
+            card_active++;
 
             // Через Lampa.Reguest и Lampa.TMDB, а не своим запросом: только так
             // работают пользовательские настройки ключа и прокси к TMDB.
@@ -1120,33 +1142,27 @@
                 '&language=' + Lampa.Storage.get('language', 'ru'));
 
             function next() {
-                title_active--;
-                pumpTitles();
+                card_active--;
+                pumpCards();
             }
 
             new Lampa.Reguest().silent(url, function (data) {
-                var name = data && (data.name || data.title);
-
-                if (name) {
-                    titles[task.key] = name;
-                    task.done(name);
+                if (data && data.id) {
+                    cards[task.key] = trim(data, task.method);
+                    task.done(cards[task.key]);
+                } else {
+                    task.done(null);
                 }
 
                 next();
-            }, next);
+            }, function () {
+                task.done(null);
+                next();
+            });
         }
     }
 
     // --- Экран «Смотреть дальше» -------------------------------------------
-
-    // Simkl отдаёт свои постеры, и этого достаточно: идти в TMDB за каждой из
-    // сорока карточек ради той же картинки — сорок лишних запросов на экран.
-    // wsrv.nl — рекомендованный самим Simkl прокси, он кеширует и снимает
-    // нагрузку с их CDN.
-    function posterUrl(path) {
-        if (!path) return BROKEN_POSTER;
-        return 'https://wsrv.nl/?url=https://simkl.in/posters/' + path + '_m.jpg&q=90';
-    }
 
     function episodeLabel(next) {
         function pad(value) { return value < 10 ? '0' + value : String(value); }
@@ -1172,126 +1188,88 @@
         });
     }
 
-    function NextScreen() {
-        var scroll = new Lampa.Scroll({ mask: true, over: true, step: 250 });
-        var grid = $('<div class="category-full"></div>');
-        var self = this;
+    // Подпись со следующей серией — единственное, чего нет у родной карточки:
+    // под постером она показывает год, и пересчитывает его сама, так что
+    // подсунуть текст через данные нельзя. Держим подписи отдельно и
+    // проставляем их после отрисовки, находя карточку по её же card_data.
+    var next_labels = {};
 
-        function finish() {
-            if (self.activity) {
-                self.activity.loader(false);
-                self.activity.toggle();
-            }
-        }
+    // Данные приезжают уже после того, как активность отрисовалась, поэтому
+    // одного события мало: проставляем и по нему, и сразу после отдачи
+    // результатов, дав Lampa тик на отрисовку карточек.
+    function scheduleLabels() {
+        setTimeout(applyLabels, 0);
+        setTimeout(applyLabels, 500);
+    }
 
-        function message(text) {
-            grid.remove();
-            scroll.append(new Lampa.Empty({ descr: text }).render());
-            finish();
-        }
+    function applyLabels() {
+        var active = Lampa.Activity.active();
+        if (!active || active.source !== SOURCE || !active.activity) return;
 
-        function build(item) {
-            var show = item.show;
-            var next = item.next_to_watch_info;
-            var tmdb = Number(show.ids && show.ids.tmdb);
+        active.activity.render().find('.card').each(function () {
+            var data = this.card_data;
+            var label = data && next_labels[data.id];
 
-            var card = Lampa.Template.get('card', { title: show.title, release_year: show.year || '' });
-            var img = card.find('.card__img')[0];
-            var name = show.title;
+            if (label) $(this).addClass('simkl-card').find('.card__age').text(label);
+        });
+    }
 
-            card.addClass('simkl-card');
-            card.find('.card__age').text(episodeLabel(next));
+    // Источник для родного category_full. Всё, что ему нужно, — метод list;
+    // остальное наследуем от tmdb, чтобы карточка, открытая из грида, ходила
+    // за деталями и сезонами ровно туда же, куда и всегда.
+    function buildSource() {
+        return Object.assign({}, Lampa.Api.sources.tmdb, {
+            list: function (params, oncomplite, onerror) {
+                if (!configured() || !token()) return onerror();
 
-            // Пока русское название едет из TMDB, карточка стоит с английским
-            // от Simkl — грид рисуется сразу и не ждёт сети.
-            if (tmdb) {
-                localTitle('tv', tmdb, function (local) {
-                    name = local;
-                    card.find('.card__title').text(local);
+                api({
+                    path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
+                    auth: true,
+                    onDone: function (data) {
+                        var items = ((data && data.shows) || []).filter(function (item) {
+                            return item && item.show && item.next_to_watch_info &&
+                                item.show.ids && item.show.ids.tmdb;
+                        });
+
+                        if (!items.length) return onerror();
+
+                        collect(sortByNext(items), oncomplite, onerror);
+                    },
+                    onFail: onerror
                 });
             }
+        });
+    }
 
-            img.onload = function () { card.addClass('card--loaded'); };
-            img.onerror = function () { img.src = BROKEN_POSTER; };
-            img.src = posterUrl(show.poster);
+    // Родному гриду нужны карточки TMDB, а Simkl отдаёт только свои id и
+    // английские названия. Собираем карточки по id — очередью, чтобы не
+    // выстрелить сорока запросами разом.
+    function collect(items, oncomplite, onerror) {
+        var results = [];
+        var waiting = items.length;
 
-            // Дальше карточку ведёт сама Lampa: открываем её обычным способом
-            // по tmdb-id, и всё остальное — сезоны, кнопки, другие плагины —
-            // работает ровно как на любой другой карточке.
-            card.on('hover:enter', function () {
-                if (!tmdb) return Lampa.Noty.show('Simkl: у тайтла нет id TMDB');
+        next_labels = {};
 
-                Lampa.Activity.push({
-                    component: 'full',
-                    id: tmdb,
-                    method: 'tv',
-                    source: 'tmdb',
-                    title: name,
-                    card: { id: tmdb, name: name, source: 'tmdb' }
-                });
-            });
+        items.forEach(function (item, index) {
+            var id = Number(item.show.ids.tmdb);
 
-            return card;
-        }
-
-        function load() {
-            if (!configured()) return message('Simkl: не задан client_id');
-            if (!token()) return message('Подключите аккаунт Simkl в настройках');
-
-            api({
-                path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
-                auth: true,
-                onDone: function (data) {
-                    var items = ((data && data.shows) || []).filter(function (item) {
-                        return item && item.show && item.next_to_watch_info;
-                    });
-
-                    if (!items.length) return message('Нечего смотреть дальше: новых серий нет');
-
-                    sortByNext(items).forEach(function (item) { grid.append(build(item)); });
-                    finish();
-                },
-                onFail: function () {
-                    message('Не удалось получить список Simkl');
+            tmdbCard('tv', id, function (card) {
+                // Порядок важен — он и есть сортировка, — поэтому кладём по
+                // индексу, а не по мере возвращения ответов.
+                if (card) {
+                    results[index] = card;
+                    next_labels[card.id] = episodeLabel(item.next_to_watch_info);
                 }
+
+                if (--waiting) return;
+
+                var ready_list = results.filter(Boolean);
+                if (!ready_list.length) return onerror();
+
+                oncomplite({ results: ready_list, total_pages: 1, page: 1 });
+                scheduleLabels();
             });
-        }
-
-        this.create = function () {
-            scroll.append(grid);
-            if (this.activity) this.activity.loader(true);
-            load();
-            return this.render();
-        };
-
-        this.start = function () {
-            Lampa.Controller.add('content', {
-                toggle: function () {
-                    Lampa.Controller.collectionSet(scroll.render());
-                    Lampa.Controller.collectionFocus(false, scroll.render());
-                },
-                up: function () {
-                    if (Navigator.canmove('up')) Navigator.move('up');
-                    else Lampa.Controller.toggle('head');
-                },
-                down: function () { Navigator.move('down'); },
-                right: function () { Navigator.move('right'); },
-                left: function () {
-                    if (Navigator.canmove('left')) Navigator.move('left');
-                    else Lampa.Controller.toggle('menu');
-                },
-                back: function () { Lampa.Activity.backward(); }
-            });
-            Lampa.Controller.toggle('content');
-        };
-
-        this.render = function () { return scroll.render(); };
-        this.pause = function () {};
-        this.stop = function () {};
-        this.destroy = function () {
-            scroll.destroy();
-            grid.remove();
-        };
+        });
     }
 
     function addMenuItem() {
@@ -1308,7 +1286,13 @@
         // hover:enter покрывает и пульт, и мышь: вешать сюда ещё и click —
         // значит открыть экран дважды
         item.on('hover:enter', function () {
-            Lampa.Activity.push({ component: SCREEN, title: SECTIONS[0].title });
+            Lampa.Activity.push({
+                component: 'category_full',
+                source: SOURCE,
+                url: SECTIONS[0].id,
+                title: SECTIONS[0].title,
+                page: 1
+            });
         });
 
         $(list).append(item);
@@ -1377,14 +1361,19 @@
 
     function startPlugin() {
         loadCache();
-        loadTitles();
+        loadCards();
         addSettings();
 
         if (!configured()) {
             console.warn('Simkl: не задан CLIENT_ID, плагин ничего не покажет');
         }
 
-        Lampa.Component.add(SCREEN, NextScreen);
+        Lampa.Api.sources[SOURCE] = buildSource();
+
+        // Подписи со следующей серией проставляем, когда грид уже отрисован
+        Lampa.Listener.follow('activity', function (e) {
+            if (e.type === 'complite') applyLabels();
+        });
 
         // Lampa перерисовывает меню на старте и при смене профиля
         addMenuItem();

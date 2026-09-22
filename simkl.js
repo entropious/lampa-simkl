@@ -275,8 +275,18 @@
         dropped: 'Брошено'
     };
 
-    // Порядок в меню смены статуса: сначала то, что выбирают чаще.
-    var LIST_ORDER = ['watching', 'completed', 'plantowatch', 'hold', 'dropped'];
+    // Категории родного «Избранного» и их пара в Simkl. «Нравится»,
+    // «Запланировано», «Продолжение следует» и история остаются чисто
+    // локальными: у Simkl нет статуса, который значил бы то же самое.
+    // Синхронизация односторонняя, Lampa → Simkl: списки Lampa плагин не
+    // трогает, чтобы не переписать то, что человек собирал руками.
+    var FAVORITE_MAP = {
+        look: 'watching',
+        viewed: 'completed',
+        wath: 'plantowatch',
+        book: 'plantowatch',
+        thrown: 'dropped'
+    };
 
     var TOKEN_KEY = 'simkl_token';
     var REFRESH_KEY = 'simkl_refresh';
@@ -678,6 +688,40 @@
         });
     }
 
+    // Разбивка по сериям нужна только когда открыли меню, и в Storage её не
+    // кладём: у длинного сериала это сотни записей на тайтл.
+    var episodes_cache = {};
+
+    function fetchEpisodes(ctx, callback) {
+        var key = cacheKey(ctx.method, ctx.card.id);
+
+        if (episodes_cache[key]) return callback(episodes_cache[key]);
+
+        api({
+            path: '/sync/watched?extended=episodes,counters',
+            method: 'POST',
+            auth: true,
+            body: [{ tmdb: Number(ctx.card.id), type: simklType(ctx.method) }],
+            onDone: function (data) {
+                var answer = Array.isArray(data) ? data[0] : null;
+                var status = answer && answer.result !== 'not_found' ? answer : null;
+
+                if (status) episodes_cache[key] = status;
+                callback(status);
+            },
+            onFail: function () {
+                Lampa.Noty.show('Simkl: не удалось получить список серий');
+            }
+        });
+    }
+
+    function invalidate(method, id) {
+        var key = cacheKey(method, id);
+
+        dropCache(key);
+        delete episodes_cache[key];
+    }
+
     // «из 8 серий», но «из 21 серии» — после числительного идёт родительный,
     // и у единицы он отличается.
     function episodeWord(count) {
@@ -752,47 +796,20 @@
         });
     }
 
-    // --- Смена статуса ---------------------------------------------------
+    // --- Запись в Simkl ---------------------------------------------------
 
     // Simkl ищет тайтл по всем переданным полям сразу, поэтому отдаём и
     // название с годом, а не только tmdb-id: так меньше шансов промахнуться.
-    function mediaItem(ctx) {
-        var item = { title: Core.cardTitle(ctx.card), ids: { tmdb: Number(ctx.card.id) } };
-        var year = Core.cardYear(ctx.card);
-
-        if (year) item.year = year;
-        return item;
-    }
-
-    function mediaBody(ctx, extra) {
-        var item = mediaItem(ctx);
+    function mediaBody(card, method, extra) {
+        var item = { title: Core.cardTitle(card), ids: { tmdb: Number(card.id) } };
+        var year = Core.cardYear(card);
         var body = {};
 
+        if (year) item.year = year;
         if (extra) Object.keys(extra).forEach(function (name) { item[name] = extra[name]; });
 
-        body[ctx.method === 'tv' ? 'shows' : 'movies'] = [item];
+        body[method === 'tv' ? 'shows' : 'movies'] = [item];
         return body;
-    }
-
-    function applyStatus(ctx, list) {
-        var request = list
-            ? { path: '/sync/add-to-list', body: mediaBody(ctx, { to: list }) }
-            : { path: '/sync/history/remove', body: mediaBody(ctx, null) };
-
-        api({
-            path: request.path,
-            method: 'POST',
-            auth: true,
-            body: request.body,
-            onDone: function () {
-                dropCache(cacheKey(ctx.method, ctx.card.id));
-                Lampa.Noty.show(list ? 'Simkl: ' + LISTS[list] : 'Simkl: убрано из списков');
-                refresh(ctx);
-            },
-            onFail: function () {
-                Lampa.Noty.show('Simkl: не удалось изменить статус');
-            }
-        });
     }
 
     function openOnSimkl(ctx) {
@@ -806,54 +823,206 @@
         if (!window.open(url, '_blank')) Lampa.Noty.show('Не удалось открыть Simkl');
     }
 
-    function openStatusMenu(ctx) {
+    // Отметка о просмотре — это событие, а не членство в списке, поэтому идёт
+    // в /sync/history. Форма тела задаёт глубину: status без seasons — весь
+    // сериал, seasons без episodes — сезон целиком, seasons с episodes —
+    // отдельные серии.
+    function sendHistory(ctx, extra, done_text) {
+        api({
+            path: '/sync/history',
+            method: 'POST',
+            auth: true,
+            body: mediaBody(ctx.card, ctx.method, extra),
+            onDone: function (data) {
+                var added = (data && data.added) || {};
+
+                // Simkl отвечает успехом и когда ничего не нашёл — судить
+                // можно только по счётчикам того, что реально записалось.
+                if (!added.episodes && !added.shows && !added.movies) {
+                    return Lampa.Noty.show('Simkl: тайтл не найден');
+                }
+
+                invalidate(ctx.method, ctx.card.id);
+                Lampa.Noty.show('Simkl: ' + done_text);
+                refresh(ctx);
+            },
+            onFail: function () {
+                Lampa.Noty.show('Simkl: не удалось отметить');
+            }
+        });
+    }
+
+    function episodeCode(place) {
+        function pad(value) { return value < 10 ? '0' + value : String(value); }
+        return 'S' + pad(place.season) + 'E' + pad(place.episode);
+    }
+
+    // Первая вышедшая, но не отмеченная серия. Именно её отмечают чаще всего,
+    // поэтому она выносится в меню отдельным пунктом — в одно нажатие.
+    function nextEpisode(status) {
+        var seasons = (status && status.seasons) || [];
+
+        for (var i = 0; i < seasons.length; i++) {
+            var episodes = seasons[i].episodes || [];
+
+            for (var j = 0; j < episodes.length; j++) {
+                if (episodes[j].aired && !episodes[j].watched) {
+                    return { season: seasons[i].number, episode: episodes[j].number };
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function openSeasonMenu(ctx, status, back) {
+        var seasons = (status && status.seasons) || [];
+
+        if (!seasons.length) return Lampa.Noty.show('Simkl: сезоны неизвестны');
+
+        var items = seasons.map(function (season) {
+            var total = season.episodes_aired || season.episodes_total || 0;
+
+            return {
+                title: 'Сезон ' + season.number,
+                subtitle: season.episodes_watched + ' из ' + total + ' ' + episodeWord(total),
+                season: season.number
+            };
+        });
+
+        Lampa.Select.show({
+            title: 'Отметить сезон целиком',
+            items: items,
+            onSelect: function (chosen) {
+                Lampa.Controller.toggle(back);
+                sendHistory(ctx, { seasons: [{ number: chosen.season }] },
+                    'сезон ' + chosen.season + ' отмечен');
+            },
+            onBack: function () { Lampa.Controller.toggle(back); }
+        });
+    }
+
+    function openEpisodeMenu(ctx) {
         if (!configured()) return Lampa.Noty.show('Simkl: не задан client_id');
-        // После подключения только обновляем карточку. Открывать список
-        // статусов сразу нельзя: он перехватывает фокус в момент, когда человек
-        // ещё дожимает подтверждение на телефоне, и случайный Enter молча
-        // отправляет в Simkl первый пункт.
+        // После подключения только обновляем карточку. Открывать меню сразу
+        // нельзя: оно перехватывает фокус в момент, когда человек ещё дожимает
+        // подтверждение на телефоне, и случайный Enter молча отправляет в
+        // Simkl первый пункт.
         if (!token()) return startPinAuth(function () { refresh(ctx); });
 
         // Куда вернуть фокус, когда список закроется. Имя контроллера карточки
         // от сборки к сборке менялось, поэтому спрашиваем текущий, а не зашиваем.
         var back = Lampa.Controller.enabled().name;
 
-        fetchStatus(ctx.method, ctx.card.id, function (status) {
-            var current = status ? status.list : '';
+        fetchEpisodes(ctx, function (status) {
+            var next = nextEpisode(status);
+            var items = [];
 
-            var items = LIST_ORDER.map(function (list) {
-                return { title: LISTS[list], list: list, selected: list === current };
-            });
+            if (next) items.push({ title: 'Отметить ' + episodeCode(next), mark: next });
 
-            if (status) items.push({ title: 'Убрать из списков', list: '' });
+            items.push({ title: 'Сезон целиком…', seasons: true });
+            items.push({ title: 'Весь сериал просмотрен', whole: true });
             items.push({ title: 'Открыть на Simkl', open: true });
 
             Lampa.Select.show({
                 title: 'Simkl',
                 items: items,
                 onSelect: function (chosen) {
+                    if (chosen.seasons) return openSeasonMenu(ctx, status, back);
+
                     Lampa.Controller.toggle(back);
 
                     if (chosen.open) return openOnSimkl(ctx);
-                    if (chosen.list !== current) applyStatus(ctx, chosen.list);
+
+                    if (chosen.mark) {
+                        return sendHistory(ctx, {
+                            seasons: [{ number: chosen.mark.season, episodes: [{ number: chosen.mark.episode }] }]
+                        }, 'отмечено ' + episodeCode(chosen.mark));
+                    }
+
+                    if (chosen.whole) {
+                        sendHistory(ctx, { status: 'completed' }, 'сериал отмечен просмотренным');
+                    }
                 },
-                onBack: function () {
-                    Lampa.Controller.toggle(back);
+                onBack: function () { Lampa.Controller.toggle(back); }
+            });
+        });
+    }
+
+    // --- Категории «Избранного» -------------------------------------------
+
+    function ready() {
+        return configured() && !!token();
+    }
+
+    function pushFavorite(card, list) {
+        if (!ready()) return;
+
+        var method = Core.cardMethod(card);
+
+        api({
+            path: '/sync/add-to-list',
+            method: 'POST',
+            auth: true,
+            body: mediaBody(card, method, { to: list }),
+            onDone: function () {
+                invalidate(method, card.id);
+                Lampa.Noty.show('Simkl: ' + LISTS[list]);
+            },
+            onFail: function () {
+                Lampa.Noty.show('Simkl: не удалось изменить статус');
+            }
+        });
+    }
+
+    function dropFavorite(card, list) {
+        if (!ready()) return;
+
+        var method = Core.cardMethod(card);
+
+        fetchStatus(method, card.id, function (status) {
+            // Снимаем только то, что сами же и поставили. Если в Simkl лежит
+            // другой статус, человек менял его там — затирать это нельзя.
+            if (!status || status.list !== list) return;
+
+            api({
+                path: '/sync/history/remove',
+                method: 'POST',
+                auth: true,
+                body: mediaBody(card, method, null),
+                onDone: function () {
+                    invalidate(method, card.id);
+                    Lampa.Noty.show('Simkl: убрано из списков');
                 }
             });
+        });
+    }
+
+    function followFavorite() {
+        Lampa.Favorite.listener.follow('add', function (e) {
+            var list = e.card && FAVORITE_MAP[e.where];
+            if (list) pushFavorite(e.card, list);
+        });
+
+        Lampa.Favorite.listener.follow('remove', function (e) {
+            var list = e.card && FAVORITE_MAP[e.where];
+            if (list) dropFavorite(e.card, list);
         });
     }
 
     function onCard(ctx) {
         if (!configured()) return;
 
-        if (Lampa.Storage.get(BUTTON_KEY, true)) {
+        // Кнопка нужна только сериалу: у него надо выбрать, что именно
+        // отмечено — серия, сезон или всё целиком. Фильму хватает категорий
+        // родного «Избранного», там выбирать нечего.
+        if (ctx.method === 'tv' && Lampa.Storage.get(BUTTON_KEY, true)) {
             Core.cardButton(ctx, {
                 className: 'simkl-status-button',
                 icon: ICON,
                 title: 'Simkl',
                 after: '.button--play',
-                onEnter: function () { openStatusMenu(ctx); }
+                onEnter: function () { openEpisodeMenu(ctx); }
             });
         }
 
@@ -930,6 +1099,7 @@
         }
 
         Core.onFullCard(onCard);
+        followFavorite();
 
         console.log('Simkl: plugin v' + manifest.version + ' ready');
     }

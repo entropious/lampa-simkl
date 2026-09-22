@@ -823,6 +823,18 @@
         if (!window.open(url, '_blank')) Lampa.Noty.show('Не удалось открыть Simkl');
     }
 
+    // Simkl отвечает успехом и тогда, когда не нашёл тайтл, так что ответ
+    // приходится разбирать. По счётчикам added судить нельзя: они считают
+    // изменения, и у повторной отметки уже отмеченного там честные нули.
+    // Настоящий отказ виден только в not_found.
+    function rejected(data) {
+        var missing = (data && data.not_found) || {};
+
+        return ['movies', 'shows', 'episodes'].some(function (kind) {
+            return (missing[kind] || []).length > 0;
+        });
+    }
+
     // Отметка о просмотре — это событие, а не членство в списке, поэтому идёт
     // в /sync/history. Форма тела задаёт глубину: status без seasons — весь
     // сериал, seasons без episodes — сезон целиком, seasons с episodes —
@@ -834,13 +846,7 @@
             auth: true,
             body: mediaBody(ctx.card, ctx.method, extra),
             onDone: function (data) {
-                var added = (data && data.added) || {};
-
-                // Simkl отвечает успехом и когда ничего не нашёл — судить
-                // можно только по счётчикам того, что реально записалось.
-                if (!added.episodes && !added.shows && !added.movies) {
-                    return Lampa.Noty.show('Simkl: тайтл не найден');
-                }
+                if (rejected(data)) return Lampa.Noty.show('Simkl: тайтл не найден');
 
                 invalidate(ctx.method, ctx.card.id);
                 Lampa.Noty.show('Simkl: ' + done_text);
@@ -965,7 +971,9 @@
             method: 'POST',
             auth: true,
             body: mediaBody(card, method, { to: list }),
-            onDone: function () {
+            onDone: function (data) {
+                if (rejected(data)) return Lampa.Noty.show('Simkl: тайтл не найден');
+
                 invalidate(method, card.id);
                 Lampa.Noty.show('Simkl: ' + LISTS[list]);
             },

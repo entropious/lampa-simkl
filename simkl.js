@@ -304,6 +304,7 @@
     var REFRESH_KEY = 'simkl_refresh';
     var EXPIRES_KEY = 'simkl_expires';
     var CACHE_KEY = 'simkl_status_cache';
+    var TITLES_KEY = 'simkl_titles';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -1055,6 +1056,87 @@
         refresh(ctx);
     }
 
+    // --- Локальные названия ------------------------------------------------
+
+    // Simkl держит русские названия в поиске — «Игра престолов» находится, — но
+    // наружу отдаёт только английские: language принимает единственное значение
+    // en, а language/locale/title_language на детальных эндпоинтах молча
+    // игнорируются. Поэтому название берём из TMDB по тому же id.
+    //
+    // Названия не меняются, так что кэш вечный: платим запросами один раз, при
+    // следующем открытии экрана он уже собран.
+    var titles = {};
+    var title_queue = [];
+    var title_active = 0;
+
+    // Три запроса разом: сорок параллельных телевизор не обрадуют, а по одному
+    // экран собирался бы заметно долго.
+    var TITLE_WORKERS = 3;
+
+    function loadTitles() {
+        try {
+            titles = Lampa.Storage.get(TITLES_KEY, '{}') || {};
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать кэш названий', e);
+        }
+    }
+
+    // Язык входит в ключ: со сменой языка Lampa кэш не должен отдавать
+    // название, набранное для прошлого.
+    function titleKey(method, id) {
+        return Lampa.Storage.get('language', 'ru') + ':' + method + ':' + id;
+    }
+
+    function localTitle(method, id, callback) {
+        var key = titleKey(method, id);
+
+        if (titles[key]) return callback(titles[key]);
+
+        title_queue.push({ key: key, method: method, id: id, done: callback });
+        pumpTitles();
+    }
+
+    function pumpTitles() {
+        if (!title_active && !title_queue.length) {
+            try {
+                Lampa.Storage.set(TITLES_KEY, titles);
+            } catch (e) {
+                console.error('Simkl: не удалось записать кэш названий', e);
+            }
+            return;
+        }
+
+        while (title_active < TITLE_WORKERS && title_queue.length) {
+            run(title_queue.shift());
+        }
+
+        function run(task) {
+            title_active++;
+
+            // Через Lampa.Reguest и Lampa.TMDB, а не своим запросом: только так
+            // работают пользовательские настройки ключа и прокси к TMDB.
+            var url = Lampa.TMDB.api(task.method + '/' + task.id +
+                '?api_key=' + Lampa.TMDB.key() +
+                '&language=' + Lampa.Storage.get('language', 'ru'));
+
+            function next() {
+                title_active--;
+                pumpTitles();
+            }
+
+            new Lampa.Reguest().silent(url, function (data) {
+                var name = data && (data.name || data.title);
+
+                if (name) {
+                    titles[task.key] = name;
+                    task.done(name);
+                }
+
+                next();
+            }, next);
+        }
+    }
+
     // --- Экран «Смотреть дальше» -------------------------------------------
 
     // Simkl отдаёт свои постеры, и этого достаточно: идти в TMDB за каждой из
@@ -1115,9 +1197,19 @@
 
             var card = Lampa.Template.get('card', { title: show.title, release_year: show.year || '' });
             var img = card.find('.card__img')[0];
+            var name = show.title;
 
             card.addClass('simkl-card');
             card.find('.card__age').text(episodeLabel(next));
+
+            // Пока русское название едет из TMDB, карточка стоит с английским
+            // от Simkl — грид рисуется сразу и не ждёт сети.
+            if (tmdb) {
+                localTitle('tv', tmdb, function (local) {
+                    name = local;
+                    card.find('.card__title').text(local);
+                });
+            }
 
             img.onload = function () { card.addClass('card--loaded'); };
             img.onerror = function () { img.src = BROKEN_POSTER; };
@@ -1134,8 +1226,8 @@
                     id: tmdb,
                     method: 'tv',
                     source: 'tmdb',
-                    title: show.title,
-                    card: { id: tmdb, name: show.title, source: 'tmdb' }
+                    title: name,
+                    card: { id: tmdb, name: name, source: 'tmdb' }
                 });
             });
 
@@ -1285,6 +1377,7 @@
 
     function startPlugin() {
         loadCache();
+        loadTitles();
         addSettings();
 
         if (!configured()) {

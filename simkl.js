@@ -866,9 +866,12 @@
 
     // Отметка о просмотре — это событие, а не членство в списке, поэтому идёт
     // в /sync/history. Форма тела задаёт глубину: status без seasons — весь
-    // сериал, seasons без episodes — сезон целиком, seasons с episodes —
-    // отдельные серии.
+    // сериал, seasons с episodes — перечисленные серии.
     function sendHistory(ctx, extra, done_text) {
+        // Поштучно шлём только непросмотренные серии, так что ноль в
+        // added.episodes здесь — это отказ, а не «уже было отмечено»
+        var expects_episodes = !!(extra && extra.seasons);
+
         api({
             path: '/sync/history',
             method: 'POST',
@@ -876,6 +879,10 @@
             body: mediaBody(ctx.card, ctx.method, extra),
             onDone: function (data) {
                 if (rejected(data)) return Lampa.Noty.show('Simkl: тайтл не найден');
+
+                if (expects_episodes && !(data && data.added && data.added.episodes)) {
+                    return Lampa.Noty.show('Simkl: ничего не отмечено');
+                }
 
                 invalidate(ctx.method, ctx.card.id);
                 Lampa.Noty.show('Simkl: ' + done_text);
@@ -967,28 +974,33 @@
         });
     }
 
-    function openSeasonMenu(ctx, status, back) {
-        var seasons = (status && status.seasons) || [];
+    // Сезон отмечается вместе со всеми предыдущими: досмотрел третий — значит,
+    // и первые два тоже. В списке только сезоны, где есть вышедшие, но не
+    // просмотренные серии. Анонсированный сезон без вышедших серий сюда не
+    // попадает: Simkl на него отвечает успехом и молча ничего не отмечает.
+    function openSeasonMenu(ctx, unwatched, back) {
+        var last_index = {};
 
-        if (!seasons.length) return Lampa.Noty.show('Simkl: сезоны неизвестны');
-
-        var items = seasons.map(function (season) {
-            var total = season.episodes_aired || season.episodes_total || 0;
-
-            return {
-                title: 'Сезон ' + season.number,
-                subtitle: season.episodes_watched + ' из ' + total + ' ' + episodeWord(total),
-                season: season.number
-            };
+        unwatched.forEach(function (place, index) {
+            last_index[place.season] = index;
         });
 
+        var seasons = Object.keys(last_index).map(Number).sort(function (a, b) { return a - b; });
+
         Lampa.Select.show({
-            title: 'Отметить сезон целиком',
-            items: items,
+            title: 'Просмотрено по сезон',
+            items: seasons.map(function (number) {
+                var count = last_index[number] + 1;
+
+                return {
+                    title: 'Сезон ' + number,
+                    subtitle: 'отметится ' + count + ' ' + episodesNominative(count),
+                    index: last_index[number]
+                };
+            }),
             onSelect: function (chosen) {
                 Lampa.Controller.toggle(back);
-                sendHistory(ctx, { seasons: [{ number: chosen.season }] },
-                    'сезон ' + chosen.season + ' отмечен');
+                markUpTo(ctx, unwatched, chosen.index);
             },
             onBack: function () { Lampa.Controller.toggle(back); }
         });
@@ -1010,15 +1022,17 @@
             var unwatched = unwatchedEpisodes(status);
             var items = [];
 
+            // Отмечать поштучно или сезонами есть смысл, только пока есть что:
+            // вышедшие и ещё не просмотренные серии
             if (unwatched.length) {
                 items.push({
                     title: 'Отметить серию…',
                     subtitle: 'следующая — ' + episodeCode(unwatched[0]),
                     episodes: true
                 });
+                items.push({ title: 'Отметить сезон…', seasons: true });
             }
 
-            items.push({ title: 'Сезон целиком…', seasons: true });
             items.push({ title: 'Весь сериал просмотрен', whole: true });
             items.push({ title: 'Открыть на Simkl', open: true });
 
@@ -1027,7 +1041,7 @@
                 items: items,
                 onSelect: function (chosen) {
                     if (chosen.episodes) return openUnwatchedMenu(ctx, unwatched, back);
-                    if (chosen.seasons) return openSeasonMenu(ctx, status, back);
+                    if (chosen.seasons) return openSeasonMenu(ctx, unwatched, back);
 
                     Lampa.Controller.toggle(back);
 

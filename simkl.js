@@ -783,6 +783,10 @@
     // toLocaleDateString на части телевизоров отдаёт американский формат
     // независимо от локали, поэтому собираем дату руками.
     function formatDate(iso) {
+        // У «Буду смотреть» даты просмотра нет, и Simkl отдаёт null, а
+        // new Date(null) — это не ошибка, а 01.01.1970
+        if (!iso) return '';
+
         var date = new Date(iso);
         if (isNaN(date.getTime())) return '';
 

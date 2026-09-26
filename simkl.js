@@ -294,13 +294,15 @@
     // он берёт данные через Lampa.Api.list, а тот диспатчится по source.
     var SOURCE = 'simkl';
 
-    // Разделы панели — по образцу Trakt. «Рекомендаций» нет: персональных
-    // рекомендаций у Simkl в API нет вовсе, а тип списка recommendation — это
-    // списки, которые пользователь собрал сам, они и так попадают в «Мои».
+    // Разделы панели — по образцу Trakt. Персональных рекомендаций у Simkl в
+    // API нет, поэтому они собираются из рекомендаций к каждому просмотренному
+    // сериалу — у TMDB и у самого Simkl, каждая в своём разделе.
     // «Понравившимся спискам» Trakt у Simkl соответствуют отслеживаемые.
     var SECTIONS = [
         { id: 'unfinished', title: 'Продолжить просмотр' },
         { id: 'plan', title: 'Буду смотреть' },
+        { id: 'recs_tmdb', title: 'Рекомендации TMDB' },
+        { id: 'recs_simkl', title: 'Рекомендации Simkl' },
         { id: 'lists', title: 'Мои списки', lists: true },
         { id: 'followed', title: 'Отслеживаемые списки', lists: true }
     ];
@@ -314,6 +316,7 @@
     var CARDS_KEY = 'simkl_cards_v2';
     var ANIME_TMDB_KEY = 'simkl_anime_tmdb';
     var PARTS_KEY = 'simkl_anime_parts';
+    var RECS_KEY = 'simkl_recs';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -977,7 +980,7 @@
     // Статус сериала целиком. Если хоть одна часть в «Смотрю», сериал
     // смотрят, даже когда прошлые части закрыты; «Просмотрено» — только если
     // ничего другого нет.
-    var PARTS_LIST_ORDER = ['watching', 'hold', 'plantowatch', 'dropped', 'completed'];
+    var PARTS_LIST_ORDER = ['watching', 'plantowatch', 'dropped', 'completed'];
 
     function assemble(parts, catalogs, answers) {
         var by_part = {};
@@ -1515,12 +1518,31 @@
         };
     }
 
+    // Одну и ту же карточку могут попросить разом — подписи рекомендаций
+    // ссылаются на один источник по двадцать раз. В сеть уходит один запрос.
+    var card_waiting = {};
+
     function tmdbCard(method, id, callback) {
         var key = cardKey(method, id);
 
         if (cards[key]) return callback(cards[key]);
+        if (card_waiting[key]) return card_waiting[key].push(callback);
 
-        card_queue.push({ key: key, method: method, id: id, done: callback });
+        card_waiting[key] = [callback];
+
+        tmdbGet(method + '/' + id, function (data) {
+            if (data && data.id) cards[key] = trim(data, method);
+
+            var waiting = card_waiting[key];
+            delete card_waiting[key];
+
+            waiting.forEach(function (fn) { fn(cards[key] || null); });
+        });
+    }
+
+    // Любой запрос к TMDB идёт через одну очередь: и карточки, и рекомендации
+    function tmdbGet(path, done) {
+        card_queue.push({ path: path, done: done });
         pumpCards();
     }
 
@@ -1543,8 +1565,9 @@
 
             // Через Lampa.Reguest и Lampa.TMDB, а не своим запросом: только так
             // работают пользовательские настройки ключа и прокси к TMDB.
-            var url = Lampa.TMDB.api(task.method + '/' + task.id +
-                '?api_key=' + Lampa.TMDB.key() +
+            var url = Lampa.TMDB.api(task.path +
+                (task.path.indexOf('?') === -1 ? '?' : '&') +
+                'api_key=' + Lampa.TMDB.key() +
                 '&language=' + Lampa.Storage.get('language', 'ru'));
 
             function next() {
@@ -1553,13 +1576,7 @@
             }
 
             new Lampa.Reguest().silent(url, function (data) {
-                if (data && data.id) {
-                    cards[task.key] = trim(data, task.method);
-                    task.done(cards[task.key]);
-                } else {
-                    task.done(null);
-                }
-
+                task.done(data);
                 next();
             }, function () {
                 task.done(null);
@@ -1775,12 +1792,12 @@
         return episodeCode(anime ? { episode: best.episode } : best);
     }
 
-    // Всё, что в «Смотрю» или «Отложено» и где остались вышедшие непросмотренные
-    // серии — в том числе ещё не начатое: в «Смотрю» оно стоит не просто так.
+    // Всё, что в «Смотрю» и где остались вышедшие непросмотренные серии — в том
+    // числе ещё не начатое: в «Смотрю» оно стоит не просто так.
     function loadUnfinished(done, fail) {
         var paths = [
-            'shows/watching?extended=full', 'shows/hold?extended=full',
-            'anime/watching?extended=full', 'anime/hold?extended=full'
+            'shows/watching?extended=full',
+            'anime/watching?extended=full'
         ];
 
         fetchBuckets(paths, function (rows) {
@@ -1841,6 +1858,293 @@
         fetchBuckets(paths, function (rows) {
             rows.sort(byDateDesc('added_to_watchlist_at'));
             done(rows.map(function (row) { return rowEntry(row); }));
+        }, fail);
+    }
+
+    // --- Рекомендации --------------------------------------------------------
+
+    // Рекомендации к тайтлу меняются медленно, а сериалов в истории бывают
+    // сотни — поэтому ответ на каждый хранится неделю.
+    var RECS_TTL = 7 * 24 * 60 * 60 * 1000;
+
+    // Сколько просмотренных сериалов берём в расчёт — каждый источник это
+    // запрос. Берём случайные, а не последние: иначе рекомендации всегда
+    // крутились бы вокруг одних и тех же свежих сериалов.
+    var RECS_SOURCES = 40;
+
+    // Simkl разрешает параллельные запросы к деталям, но сорок разом ни к
+    // чему — хватит четырёх.
+    var SIMKL_WORKERS = 4;
+
+    var recs = {};
+
+    function loadRecs() {
+        try {
+            var saved = Lampa.Storage.get(RECS_KEY, '{}') || {};
+
+            Object.keys(saved).forEach(function (key) {
+                if (saved[key] && Date.now() - saved[key].at < RECS_TTL) recs[key] = saved[key];
+            });
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать кэш рекомендаций', e);
+        }
+    }
+
+    function persistRecs() {
+        try {
+            Lampa.Storage.set(RECS_KEY, recs);
+        } catch (e) {
+            console.error('Simkl: не удалось записать кэш рекомендаций', e);
+        }
+    }
+
+    // Оценка человека делает источник весомее или легче: то, что он оценил
+    // на 9, говорит о вкусе больше, чем проходное на 5. Оценённое ниже 5 в
+    // источники не попадает вовсе (см. recSources) — советовать похожее на
+    // то, что не понравилось, незачем.
+    function ratingWeight(rating) {
+        if (!rating) return 1;
+        if (rating >= 8) return 1.3;
+        if (rating <= 5) return 0.6;
+        return 1;
+    }
+
+    // Источники — сериалы и аниме, которые реально смотрели: досмотренные и
+    // начатые в «Смотрю». Брошенное и «Буду смотреть» о вкусе
+    // не говорят. Вся библиотека при этом нужна целиком — рекомендовать то,
+    // что уже в любом списке, включая брошенное, незачем.
+    // Тасовка Фишера — Йетса: каждый порядок равновероятен, в отличие от
+    // sort со случайным компаратором
+    function shuffled(items) {
+        var copy = items.slice();
+
+        for (var i = copy.length - 1; i > 0; i--) {
+            var j = Math.floor(Math.random() * (i + 1));
+            var swap = copy[i];
+
+            copy[i] = copy[j];
+            copy[j] = swap;
+        }
+
+        return copy;
+    }
+
+    function recSources(done, fail) {
+        fetchBuckets(['shows', 'anime'], function (rows) {
+            var library = {};
+            var sources = [];
+
+            rows.forEach(function (row) {
+                var ids = rowMedia(row).ids || {};
+                var method = rowMethod(row);
+                var status = row.item.status;
+
+                if (ids.simkl) library['simkl:' + ids.simkl] = true;
+                if (Number(ids.tmdb)) library[method + ':' + Number(ids.tmdb)] = true;
+
+                var started = status === 'watching' && row.item.last_watched_at;
+                if (method !== 'tv' || !(status === 'completed' || started)) return;
+                if (row.item.user_rating && row.item.user_rating < 5) return;
+
+                sources.push({
+                    method: 'tv',
+                    tmdb: Number(ids.tmdb) || 0,
+                    simkl: ids.simkl,
+                    anime: row.type === 'anime',
+                    weight: ratingWeight(row.item.user_rating),
+                    at: Date.parse(row.item.last_watched_at) || 0
+                });
+            });
+
+            // Продолжения аниме без своего tmdb-id сводятся к сериалу целиком
+            resolveAnime(sources, function (resolved) {
+                var seen = {};
+
+                sources = shuffled(resolved.filter(function (source) {
+                    if (!source.tmdb || seen[source.tmdb]) return false;
+
+                    seen[source.tmdb] = true;
+                    library['tv:' + source.tmdb] = true;
+                    return true;
+                })).slice(0, RECS_SOURCES);
+
+                done(sources, library);
+            });
+        }, fail);
+    }
+
+    // Рекомендации TMDB к сериалу сразу приходят готовыми карточками — с
+    // русским названием и постером, так что отдельный запрос за карточкой
+    // не нужен.
+    function tmdbRecs(source, done) {
+        var key = 'tmdb:' + Lampa.Storage.get('language', 'ru') + ':' + source.tmdb;
+        if (recs[key]) return done(recs[key].list);
+
+        tmdbGet('tv/' + source.tmdb + '/recommendations', function (data) {
+            if (!data || !Array.isArray(data.results)) return done([]);
+
+            var list = data.results.filter(function (item) {
+                return item && item.id;
+            }).map(function (item) {
+                return { method: 'tv', tmdb: item.id, card: trim(item, 'tv') };
+            });
+
+            recs[key] = { at: Date.now(), list: list };
+            done(list);
+        });
+    }
+
+    // У Simkl рекомендации лежат прямо в деталях тайтла, users_recommendations.
+    // Это публичный эндпоинт, токен не нужен — и так ответ берётся из кэша
+    // Cloudflare. tmdb-id в рекомендациях обычно есть, у продолжений аниме —
+    // нет, их потом сводит resolveAnime.
+    function simklRecs(source, done) {
+        var key = 'simkl:' + source.simkl;
+        if (recs[key]) return done(recs[key].list);
+
+        api({
+            path: '/' + (source.anime ? 'anime' : 'tv') + '/' + encodeURIComponent(source.simkl),
+            onDone: function (data) {
+                var list = ((data && data.users_recommendations) || []).map(function (item) {
+                    var movie = item.type === 'movie' || item.anime_type === 'movie';
+
+                    return {
+                        method: movie ? 'movie' : 'tv',
+                        tmdb: Number(item.ids && item.ids.tmdb) || 0,
+                        simkl: item.ids && item.ids.simkl
+                    };
+                }).filter(function (item) {
+                    return item.tmdb || item.simkl;
+                });
+
+                recs[key] = { at: Date.now(), list: list };
+                done(list);
+            },
+            onFail: function () { done([]); }
+        });
+    }
+
+    // Не больше workers заданий разом, done — когда отработали все
+    function pool(items, workers, task, done) {
+        var index = 0;
+        var active = 0;
+
+        function next() {
+            if (index >= items.length && !active) return done();
+
+            while (active < workers && index < items.length) {
+                active++;
+
+                task(items[index++], function () {
+                    active--;
+                    next();
+                });
+            }
+        }
+
+        next();
+    }
+
+    // Подпись: на какой из просмотренных сериалов больше всего похоже —
+    // «как «Во все тяжкие» +2». Название источника берём из TMDB, у
+    // Simkl оно только английское.
+    function recLabel(from) {
+        return function (card, done) {
+            tmdbCard('tv', from[0], function (source) {
+                if (!source) return done('');
+
+                var name = '«' + (source.name || source.title || source.original_name) + '»';
+                var more = from.length - 1;
+
+                done('как ' + name + (more ? ' +' + more : ''));
+            });
+        };
+    }
+
+    // Сводный рейтинг: каждая рекомендация добавляет баллы, тем больше, чем
+    // выше она в списке у источника и чем выше человек оценил сам источник.
+    // Сериал, который советуют к нескольким просмотренным, поднимается наверх.
+    function loadRecommended(provider, done, fail) {
+        recSources(function (sources, library) {
+            if (!sources.length) return done([]);
+
+            var fetch = provider === 'simkl' ? simklRecs : tmdbRecs;
+            var scores = {};
+            var order = [];
+
+            function add(item, source, points) {
+                var key = item.tmdb ? item.method + ':' + item.tmdb : 'simkl:' + item.simkl;
+                var entry_score = scores[key];
+
+                if (!entry_score) {
+                    entry_score = scores[key] = { item: item, score: 0, from: [] };
+                    order.push(key);
+                }
+
+                entry_score.score += points;
+                entry_score.from.push({ tmdb: source.tmdb, points: points });
+            }
+
+            var workers = provider === 'simkl' ? SIMKL_WORKERS : sources.length;
+
+            pool(sources, workers, function (source, next) {
+                fetch(source, function (list) {
+                    // Баллы быстро падают с местом в списке: иначе первый
+                    // десяток занимал бы один любимый сериал, а не лучшее
+                    // от каждого по очереди
+                    list.forEach(function (item, index) {
+                        add(item, source, source.weight / (1 + index * 0.3));
+                    });
+                    next();
+                });
+            }, function () {
+                persistRecs();
+
+                var items = order.map(function (key) { return scores[key]; });
+
+                resolveAnime(items.map(function (row) { return row.item; }), function () {
+                    // После сведения аниме к сериалу одна карточка может
+                    // прийти под двумя ключами — баллы складываем
+                    var merged = {};
+                    var list = [];
+
+                    items.forEach(function (row) {
+                        var item = row.item;
+                        if (!item.tmdb) return;
+                        if (library[item.method + ':' + item.tmdb]) return;
+                        if (item.simkl && library['simkl:' + item.simkl]) return;
+
+                        var key = item.method + ':' + item.tmdb;
+
+                        if (merged[key]) {
+                            merged[key].score += row.score;
+                            merged[key].from = merged[key].from.concat(row.from);
+                            return;
+                        }
+
+                        merged[key] = row;
+                        list.push(row);
+                    });
+
+                    list.sort(function (a, b) { return b.score - a.score; });
+
+                    done(list.map(function (row) {
+                        // Источники по вкладу, каждый один раз
+                        var from = [];
+
+                        row.from.sort(function (a, b) { return b.points - a.points; }).forEach(function (part) {
+                            if (from.indexOf(part.tmdb) === -1) from.push(part.tmdb);
+                        });
+
+                        return {
+                            method: row.item.method,
+                            tmdb: row.item.tmdb,
+                            card: row.item.card,
+                            label: recLabel(from)
+                        };
+                    }));
+                });
+            });
         }, fail);
     }
 
@@ -1917,6 +2221,8 @@
 
         if (url === 'unfinished') return loadUnfinished(store, fail);
         if (url === 'plan') return loadPlan(store, fail);
+        if (url === 'recs_tmdb') return loadRecommended('tmdb', store, fail);
+        if (url === 'recs_simkl') return loadRecommended('simkl', store, fail);
         if (String(url).indexOf('list:') === 0) return loadList(url.slice(5), store, fail);
 
         fail();
@@ -1998,7 +2304,12 @@
         }
 
         slice.forEach(function (item, index) {
-            tmdbCard(item.method, item.tmdb, function (card) {
+            // Рекомендации TMDB приходят уже с карточкой
+            var get = item.card
+                ? function (method, id, callback) { callback(item.card); }
+                : tmdbCard;
+
+            get(item.method, item.tmdb, function (card) {
                 if (!card) return next();
 
                 // Порядок важен — он и есть сортировка, — поэтому кладём по
@@ -2160,6 +2471,7 @@
         loadCards();
         loadAnimeTmdb();
         loadParts();
+        loadRecs();
         addSettings();
 
         if (!configured()) {

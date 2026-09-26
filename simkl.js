@@ -343,10 +343,12 @@
         .simkl-pin__link a { color: inherit; }
         .simkl-pin__state { margin-top: 1em; opacity: 0.6; }
         #lampa-simkl-menu .menu__ico svg { width: 100%; height: 100%; }
-        /* Вместо года в карточке стоит следующая серия с названием, а оно
-           бывает длинным — обрезаем, чтобы ряд не разъезжался. */
+        /* Вместо года в карточке стоит своя подпись. В одну строку не влезает
+           «как «Мастер на все руки Сайга» +2» из рекомендаций, поэтому даём
+           две, а дальше многоточие — чтобы ряд всё же не разъезжался. */
         .simkl-card .card__age {
-            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+            white-space: normal; overflow: hidden; text-overflow: ellipsis;
         }
         /* Lampa запрещает выделение на всём приложении — она про пульт. Но код
            и ссылку с мышью хочется скопировать, так что здесь возвращаем. */

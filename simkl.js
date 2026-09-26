@@ -300,8 +300,8 @@
     // «Понравившимся спискам» Trakt у Simkl соответствуют отслеживаемые.
     var SECTIONS = [
         { id: 'next', title: 'Смотреть дальше' },
+        { id: 'unfinished', title: 'Продолжить просмотр' },
         { id: 'plan', title: 'Буду смотреть' },
-        { id: 'calendar', title: 'Календарь' },
         { id: 'lists', title: 'Мои списки', lists: true },
         { id: 'followed', title: 'Отслеживаемые списки', lists: true }
     ];
@@ -310,7 +310,9 @@
     var REFRESH_KEY = 'simkl_refresh';
     var EXPIRES_KEY = 'simkl_expires';
     var CACHE_KEY = 'simkl_status_cache';
-    var CARDS_KEY = 'simkl_cards';
+    // Номер в ключе меняется, когда в карточке появляется новое поле: иначе
+    // вечный кэш так и отдавал бы карточки без него
+    var CARDS_KEY = 'simkl_cards_v2';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -896,6 +898,10 @@
 
     function episodeCode(place) {
         function pad(value) { return value < 10 ? '0' + value : String(value); }
+
+        // У аниме серии часто идут сквозной нумерацией, без сезонов
+        if (place.season === undefined || place.season === null) return 'E' + pad(place.episode);
+
         return 'S' + pad(place.season) + 'E' + pad(place.episode);
     }
 
@@ -1186,6 +1192,8 @@
             first_air_date: data.first_air_date,
             release_date: data.release_date,
             vote_average: data.vote_average,
+            // Дата выхода последней вышедшей серии — для подписи в «Продолжить просмотр»
+            last_air_date: data.last_air_date,
             source: 'tmdb',
             media_type: method
         };
@@ -1255,12 +1263,6 @@
     var ENTRIES_TTL = 5 * 60 * 1000;
     var entries_cache = {};
 
-    // Календарь — общий файл на всех: пересобирается раз в шесть часов и весит
-    // пару мегабайт. В Storage такой не положить, в памяти держим три часа.
-    var CALENDAR_URL = 'https://data.simkl.in/calendar/v2/tv.json';
-    var CALENDAR_TTL = 3 * 60 * 60 * 1000;
-    var calendar_cache = null;
-
     var user_id = null;
 
     function episodeLabel(next) {
@@ -1268,12 +1270,13 @@
         return next.title ? code + ' · ' + next.title : code;
     }
 
-    function shortDate(time) {
-        var date = new Date(time);
+    // TMDB отдаёт дату выхода без времени, «2026-07-26». Через new Date её не
+    // пропускаем: полночь по UTC западнее Гринвича превращается в предыдущий день.
+    function airDate(value) {
+        var parts = String(value || '').split('-');
+        if (parts.length !== 3) return '';
 
-        function pad(value) { return value < 10 ? '0' + value : String(value); }
-
-        return pad(date.getDate()) + '.' + pad(date.getMonth() + 1);
+        return parts[2] + '.' + parts[1] + '.' + parts[0].slice(2);
     }
 
     function itemsWord(count) {
@@ -1293,36 +1296,29 @@
         return tmdb ? { method: method, tmdb: tmdb, label: label } : null;
     }
 
-    function loadNext(done, fail) {
-        api({
-            path: '/sync/all-items/shows/watching?extended=full&next_watch_info=yes',
-            auth: true,
-            onDone: function (data) {
-                var items = ((data && data.shows) || []).filter(function (item) {
-                    return item && item.show && item.next_to_watch_info;
-                });
-
-                done(sortByNext(items).map(function (item) {
-                    return entry('tv', item.show.ids, episodeLabel(item.next_to_watch_info));
-                }));
-            },
-            onFail: fail
-        });
-    }
-
-    // Аналог Watchlist у Trakt. Фильмы и сериалы лежат у Simkl в разных
-    // корзинах — забираем обе и сводим по дате добавления, свежее сверху.
-    function loadPlan(done, fail) {
-        var parts = {};
+    // Аниме у Simkl — отдельная корзина, не часть сериалов: /sync/all-items/shows
+    // его не отдаёт вовсе. Поэтому любой раздел про сериалы собирает обе.
+    // Корзины приходят каждая под своим ключом — shows, movies или anime, —
+    // и тип записи берётся из пути, по которому её забрали.
+    function fetchBuckets(paths, done, fail) {
+        var rows = [];
+        var waiting = paths.length;
         var failed_once = false;
 
-        ['shows', 'movies'].forEach(function (type) {
+        paths.forEach(function (path, index) {
+            var type = path.split(/[/?]/)[0];
+
             api({
-                path: '/sync/all-items/' + type + '/plantowatch?extended=full',
+                path: '/sync/all-items/' + path,
                 auth: true,
                 onDone: function (data) {
-                    parts[type] = (data && data[type]) || [];
-                    merge();
+                    rows[index] = ((data && data[type]) || []).filter(function (item) {
+                        return item && (item.show || item.movie);
+                    }).map(function (item) {
+                        return { type: type, item: item };
+                    });
+
+                    if (--waiting === 0 && !failed_once) done([].concat.apply([], rows));
                 },
                 onFail: function () {
                     if (failed_once) return;
@@ -1331,110 +1327,115 @@
                 }
             });
         });
+    }
 
-        function merge() {
-            if (failed_once || !parts.shows || !parts.movies) return;
+    function rowMedia(row) {
+        return row.item.show || row.item.movie;
+    }
 
-            var items = parts.shows.map(function (item) {
-                return { at: item.added_to_watchlist_at, entry: entry('tv', item.show && item.show.ids) };
-            }).concat(parts.movies.map(function (item) {
-                return { at: item.added_to_watchlist_at, entry: entry('movie', item.movie && item.movie.ids) };
+    // Аниме-фильм в TMDB — фильм, всё остальное аниме — сериал
+    function rowMethod(row) {
+        if (row.type === 'movies') return 'movie';
+        if (row.type === 'anime' && row.item.anime_type === 'movie') return 'movie';
+        return 'tv';
+    }
+
+    function rowEntry(row, label) {
+        return entry(rowMethod(row), rowMedia(row).ids, label);
+    }
+
+    function byDateDesc(field) {
+        return function (a, b) {
+            return (Date.parse(b.item[field]) || 0) - (Date.parse(a.item[field]) || 0);
+        };
+    }
+
+    function loadNext(done, fail) {
+        var paths = [
+            'shows/watching?extended=full&next_watch_info=yes',
+            'anime/watching?extended=full&next_watch_info=yes'
+        ];
+
+        fetchBuckets(paths, function (rows) {
+            rows = rows.filter(function (row) { return row.item.next_to_watch_info; });
+
+            done(sortByNext(rows).map(function (row) {
+                return rowEntry(row, episodeLabel(row.item.next_to_watch_info));
             }));
+        }, fail);
+    }
 
-            items.sort(function (a, b) {
-                return (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0);
+    // Где остановился — самая дальняя отмеченная серия. Готовое поле
+    // last_watched для этого не годится: это серия, отмеченная последней по
+    // времени, и после отметки задним числом оно показывает не туда —
+    // «Вальхалла» с двумя досмотренными сезонами числилась на S01E08. С
+    // extended=full в seasons приходят именно отмеченные серии.
+    function furthestWatched(item) {
+        var best = null;
+
+        (item.seasons || []).forEach(function (season) {
+            // Сезон 0 — спецвыпуски, по ним «где остановился» не считают
+            if (!season.number) return;
+
+            (season.episodes || []).forEach(function (episode) {
+                var further = !best || season.number > best.season ||
+                    (season.number === best.season && episode.number > best.episode);
+
+                if (further) best = { season: season.number, episode: episode.number };
+            });
+        });
+
+        return best ? episodeCode(best) : item.last_watched;
+    }
+
+    // Начатое и не досмотренное: есть просмотренные серии и есть вышедшие
+    // непросмотренные. Отложенное сюда тоже входит — оно ровно такое. От
+    // «Смотреть дальше» раздел отличается тем, что там есть и ещё не начатое.
+    function loadUnfinished(done, fail) {
+        var paths = [
+            'shows/watching?extended=full', 'shows/hold?extended=full',
+            'anime/watching?extended=full', 'anime/hold?extended=full'
+        ];
+
+        fetchBuckets(paths, function (rows) {
+            rows = rows.filter(function (row) {
+                var item = row.item;
+
+                row.watched = item.watched_episodes_count || 0;
+                row.aired = (item.total_episodes_count || 0) - (item.not_aired_episodes_count || 0);
+
+                return row.watched > 0 && row.watched < row.aired;
             });
 
-            done(items.map(function (item) { return item.entry; }));
-        }
-    }
+            rows.sort(byDateDesc('last_watched_at'));
 
-    function fetchCalendar(done, fail) {
-        if (calendar_cache && Date.now() - calendar_cache.at < CALENDAR_TTL) {
-            return done(calendar_cache.data);
-        }
+            // «S02E08 · 10 из 16 · 26.07.26»: где остановился, сколько из
+            // вышедшего посмотрено и когда вышла последняя серия. Дата есть
+            // только в карточке TMDB, поэтому подпись собирается, когда та приехала.
+            done(rows.map(function (row) {
+                var last = furthestWatched(row.item);
+                var progress = row.watched + ' из ' + row.aired;
 
-        // Файл лежит на CDN, а не в API: токен не нужен, но client_id и имя
-        // приложения Simkl просит и здесь.
-        Core.request({
-            url: CALENDAR_URL + '?client_id=' + encodeURIComponent(CLIENT_ID) +
-                '&app-name=' + encodeURIComponent(APP_NAME) +
-                '&app-version=' + encodeURIComponent(APP_VERSION),
-            timeout: 30000,
-            onDone: function (data) {
-                if (!data || !data.calendar) return fail();
-
-                calendar_cache = { at: Date.now(), data: data };
-                done(data);
-            },
-            onFail: fail
-        });
-    }
-
-    // Персонального календаря у Simkl нет — есть общий файл на ~5 недель
-    // вперёд. Пересекаем его со своими сериалами и берём по одной, ближайшей,
-    // серии на сериал.
-    function loadCalendar(done, fail) {
-        var mine = null;
-        var calendar = null;
-        var failed_once = false;
-
-        function stop() {
-            if (failed_once) return;
-            failed_once = true;
-            fail();
-        }
-
-        // Все сериалы разом, без разбивки по статусам: один запрос вместо пяти
-        api({
-            path: '/sync/all-items/shows',
-            auth: true,
-            onDone: function (data) {
-                mine = {};
-
-                ((data && data.shows) || []).forEach(function (item) {
-                    // Брошенное в календарь не тащим: человек от него отказался сам
-                    if (item.status === 'dropped') return;
-
-                    var id = item.show && item.show.ids && item.show.ids.simkl;
-                    if (id) mine[id] = true;
+                return rowEntry(row, function (card) {
+                    return [last, progress, airDate(card.last_air_date)].filter(Boolean).join(' · ');
                 });
-
-                join();
-            },
-            onFail: stop
-        });
-
-        fetchCalendar(function (data) {
-            calendar = data;
-            join();
-        }, stop);
-
-        function join() {
-            if (failed_once || !mine || !calendar) return;
-
-            var now = Date.now();
-            var nearest = {};
-
-            calendar.calendar.forEach(function (item) {
-                if (!mine[item.simkl_id] || !item.episode) return;
-
-                var at = Date.parse(item.date) || 0;
-                if (at < now) return;
-
-                if (!nearest[item.simkl_id] || at < nearest[item.simkl_id].at) {
-                    nearest[item.simkl_id] = { at: at, item: item };
-                }
-            });
-
-            var list = Object.keys(nearest).map(function (id) { return nearest[id]; });
-            list.sort(function (a, b) { return a.at - b.at; });
-
-            done(list.map(function (found) {
-                var meta = calendar.metadata[found.item.simkl_id] || {};
-                return entry('tv', meta.ids, episodeCode(found.item.episode) + ' · ' + shortDate(found.at));
             }));
-        }
+        }, fail);
+    }
+
+    // Аналог Watchlist у Trakt: фильмы, сериалы и аниме, сведённые по дате
+    // добавления, свежее сверху.
+    function loadPlan(done, fail) {
+        var paths = [
+            'shows/plantowatch?extended=full',
+            'movies/plantowatch?extended=full',
+            'anime/plantowatch?extended=full'
+        ];
+
+        fetchBuckets(paths, function (rows) {
+            rows.sort(byDateDesc('added_to_watchlist_at'));
+            done(rows.map(function (row) { return rowEntry(row); }));
+        }, fail);
     }
 
     function fetchUserId(done, fail) {
@@ -1497,8 +1498,8 @@
         }
 
         if (url === 'next') return loadNext(store, fail);
+        if (url === 'unfinished') return loadUnfinished(store, fail);
         if (url === 'plan') return loadPlan(store, fail);
-        if (url === 'calendar') return loadCalendar(store, fail);
         if (String(url).indexOf('list:') === 0) return loadList(url.slice(5), store, fail);
 
         fail();
@@ -1507,12 +1508,12 @@
     // Сначала то, что уже вышло и ждёт просмотра, свежее сверху; потом сериалы,
     // чья следующая серия ещё не вышла. Иначе анонсы будущих серий оттеснили бы
     // вниз ровно то, ради чего экран и открывают.
-    function sortByNext(items) {
+    function sortByNext(rows) {
         var now = Date.now();
 
-        return items.slice().sort(function (a, b) {
-            var at = Date.parse(a.next_to_watch_info.date) || 0;
-            var bt = Date.parse(b.next_to_watch_info.date) || 0;
+        return rows.slice().sort(function (a, b) {
+            var at = Date.parse(a.item.next_to_watch_info.date) || 0;
+            var bt = Date.parse(b.item.next_to_watch_info.date) || 0;
             var a_aired = at <= now;
             var b_aired = bt <= now;
 
@@ -1524,7 +1525,7 @@
     // Подпись под постером — единственное, чего нет у родной карточки: там
     // стоит год, и пересчитывает его она сама, так что подсунуть текст через
     // данные нельзя. Держим подписи отдельно, по разделам — у одного сериала
-    // в «Смотреть дальше» и в календаре они разные, — и проставляем после
+    // в «Смотреть дальше» и в «Продолжить просмотр» они разные, — и проставляем после
     // отрисовки, находя карточку по её же card_data.
     var labels = {};
 
@@ -1595,7 +1596,8 @@
                 // индексу, а не по мере возвращения ответов.
                 if (card) {
                     results[index] = card;
-                    if (item.label) section[card.id] = item.label;
+                    var label = typeof item.label === 'function' ? item.label(card) : item.label;
+                    if (label) section[card.id] = label;
                 }
 
                 if (--waiting) return;

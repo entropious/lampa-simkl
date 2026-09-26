@@ -313,6 +313,7 @@
     // вечный кэш так и отдавал бы карточки без него
     var CARDS_KEY = 'simkl_cards_v2';
     var ANIME_TMDB_KEY = 'simkl_anime_tmdb';
+    var PARTS_KEY = 'simkl_anime_parts';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -699,12 +700,26 @@
             auth: true,
             body: [{ tmdb: Number(id), type: simklType(method) }],
             onDone: function (data) {
-                var answer = Array.isArray(data) ? data[0] : null;
+                withParts(method, id, Array.isArray(data) ? data[0] : null, function (answer) {
+                    // result бывает трёх видов: true — лежит в списке, false —
+                    // Simkl знает тайтл, но у человека его нет, 'not_found' —
+                    // тайтла нет и в самом Simkl. Последние два для нас одно и
+                    // то же. В Storage кладём без разбивки по сериям: у
+                    // собранного аниме она на сотни записей.
+                    if (!answer || answer.result !== true) return done(null);
 
-                // result бывает трёх видов: true — лежит в списке, false —
-                // Simkl знает тайтл, но у человека его нет, 'not_found' —
-                // тайтла нет и в самом Simkl. Последние два для нас одно и то же.
-                done(answer && answer.result === true ? answer : null);
+                    done({
+                        result: true,
+                        list: answer.list,
+                        last_watched_at: answer.last_watched_at,
+                        episodes_watched: answer.episodes_watched,
+                        episodes_aired: answer.episodes_aired,
+                        episodes_total: answer.episodes_total,
+                        // Только у аниме, собранного из частей
+                        merged: !!answer.merged,
+                        last_code: answer.last_code
+                    });
+                });
             },
             onFail: function () {
                 // Ошибку не кэшируем: следующая карточка попробует снова
@@ -730,11 +745,12 @@
             auth: true,
             body: [{ tmdb: Number(ctx.card.id), type: simklType(ctx.method) }],
             onDone: function (data) {
-                var answer = Array.isArray(data) ? data[0] : null;
-                var status = answer && answer.result !== 'not_found' ? answer : null;
+                withParts(ctx.method, ctx.card.id, Array.isArray(data) ? data[0] : null, function (answer) {
+                    var status = answer && answer.result !== 'not_found' ? answer : null;
 
-                if (status) episodes_cache[key] = status;
-                callback(status);
+                    if (status) episodes_cache[key] = status;
+                    callback(status);
+                });
             },
             onFail: function () {
                 Lampa.Noty.show('Simkl: не удалось получить список серий');
@@ -827,6 +843,274 @@
         });
     }
 
+    // --- Аниме из нескольких частей ----------------------------------------
+
+    // Simkl, как MyAnimeList, режет аниме на части: «Атака титанов» у него —
+    // шесть отдельных тайтлов, «Slay the Gods» — два. В TMDB это один сериал с
+    // сезонами, карточка в Lampa тоже одна, а /sync/watched по её tmdb-id
+    // отдаёт только первую часть. Поэтому части собираются в один сериал: по
+    // связям первой части находим остальные, по каталогу — их серии, по
+    // /sync/watched с simkl-id — отметки.
+    //
+    // Отмечаем тоже по частям, их собственной нумерацией (конверт anime[]).
+    // Путь через use_tvdb_anime_seasons не годится: у «Slay the Gods 2» Simkl
+    // проставил сериям те же координаты S1E1…, что и у первой части, и
+    // вторая часть уезжала бы в первую.
+
+    // Состав частей меняется, только когда анонсируют продолжение, — неделя.
+    // Серии части добавляются, пока она выходит, — сутки.
+    var PARTS_TTL = 7 * 24 * 60 * 60 * 1000;
+    var PART_EPISODES_TTL = 24 * 60 * 60 * 1000;
+
+    // tmdb → { at, parts }: simkl-id частей по порядку или false, если это не
+    // аниме или часть одна — тогда обычный путь справляется сам
+    var parts_map = {};
+    var part_episodes = {};
+
+    function loadParts() {
+        try {
+            parts_map = Lampa.Storage.get(PARTS_KEY, '{}') || {};
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать части аниме', e);
+        }
+    }
+
+    function persistParts() {
+        try {
+            Lampa.Storage.set(PARTS_KEY, parts_map);
+        } catch (e) {
+            console.error('Simkl: не удалось записать части аниме', e);
+        }
+    }
+
+    // Из связей берём только продолжение того же сериала: сиквел или приквел
+    // в формате сериала. Спешлы, полнометражки, спин-оффы и «альтернативные
+    // версии» — отдельные тайтлы.
+    function sameShow(rel, own, tmdb) {
+        var kind = String(rel.relation_type || '');
+        var ids = rel.ids || {};
+
+        if (kind !== 'sequel' && kind !== 'prequel' && kind.indexOf('season') !== 0) return false;
+        if (rel.anime_type !== 'tv' && rel.anime_type !== 'ona') return false;
+
+        // У финального сезона «Атаки титанов» tmdb-id свой, а TVDB общий с
+        // остальными частями, так что общий TVDB перевешивает
+        if (ids.tvdb && own.tvdb) return String(ids.tvdb) === String(own.tvdb);
+
+        return !ids.tmdb || Number(ids.tmdb) === Number(tmdb);
+    }
+
+    function animeParts(tmdb, base, done) {
+        var hit = parts_map[tmdb];
+        if (hit && Date.now() - hit.at < PARTS_TTL) return done(hit.parts || null);
+
+        api({
+            path: '/anime/' + encodeURIComponent(base) + '?extended=full',
+            auth: true,
+            onDone: function (data) {
+                var parts = false;
+
+                // На обычный сериал /anime/{id} отвечает его же карточкой без
+                // anime_type — по этому их и различаем
+                if (data && data.anime_type) {
+                    parts = [Number(base)];
+
+                    (data.relations || []).forEach(function (rel) {
+                        var id = rel.ids && Number(rel.ids.simkl);
+
+                        if (id && parts.indexOf(id) === -1 && sameShow(rel, data.ids || {}, tmdb)) {
+                            parts.push(id);
+                        }
+                    });
+
+                    if (parts.length < 2) parts = false;
+                }
+
+                parts_map[tmdb] = { at: Date.now(), parts: parts };
+                persistParts();
+                done(parts || null);
+            },
+            onFail: function () { done(null); }
+        });
+    }
+
+    function fetchPartEpisodes(id, done) {
+        var hit = part_episodes[id];
+        if (hit && Date.now() - hit.at < PART_EPISODES_TTL) return done(hit.list);
+
+        api({
+            path: '/anime/episodes/' + encodeURIComponent(id),
+            auth: true,
+            onDone: function (data) {
+                // Спешлы идут отдельной строкой, в нумерацию сезонов не входят
+                var list = (Array.isArray(data) ? data : []).filter(function (episode) {
+                    return episode && episode.type === 'episode';
+                });
+
+                part_episodes[id] = { at: Date.now(), list: list };
+                done(list);
+            },
+            onFail: function () { done([]); }
+        });
+    }
+
+    // Координаты TVDB годятся, только если они есть у каждой серии и не
+    // пересекаются между частями. У «Slay the Gods» обе части размечены как
+    // S1E1…S1E15 — тогда сезон считаем по порядку частей: так их нумерует и
+    // TMDB.
+    function tvdbUsable(ordered, catalogs) {
+        var seen = {};
+
+        return ordered.every(function (id) {
+            return catalogs[id].every(function (episode) {
+                if (!episode.tvdb || !episode.tvdb.season) return false;
+
+                var key = episode.tvdb.season + ':' + episode.tvdb.episode;
+                if (seen[key]) return false;
+
+                seen[key] = true;
+                return true;
+            });
+        });
+    }
+
+    // Статус сериала целиком. Если хоть одна часть в «Смотрю», сериал
+    // смотрят, даже когда прошлые части закрыты; «Просмотрено» — только если
+    // ничего другого нет.
+    var PARTS_LIST_ORDER = ['watching', 'hold', 'plantowatch', 'dropped', 'completed'];
+
+    function assemble(parts, catalogs, answers) {
+        var by_part = {};
+
+        answers.forEach(function (answer) {
+            if (answer && answer.simkl) by_part[answer.simkl] = answer;
+        });
+
+        var ordered = parts.filter(function (id) {
+            return (catalogs[id] || []).length;
+        }).sort(function (a, b) {
+            return (Date.parse(catalogs[a][0].date) || 0) - (Date.parse(catalogs[b][0].date) || 0);
+        });
+
+        var use_tvdb = tvdbUsable(ordered, catalogs);
+        var seasons = {};
+        var present = [];
+        var last_watched_at = null;
+
+        ordered.forEach(function (id, index) {
+            var answer = by_part[id];
+            var watched = {};
+
+            if (answer && answer.result === true) {
+                present.push(answer.list);
+
+                if (answer.last_watched_at && (!last_watched_at || answer.last_watched_at > last_watched_at)) {
+                    last_watched_at = answer.last_watched_at;
+                }
+            }
+
+            // Отметки приходят в нумерации части, там же, где и каталог
+            ((answer && answer.seasons) || []).forEach(function (season) {
+                (season.episodes || []).forEach(function (episode) {
+                    if (episode.watched) watched[episode.number] = true;
+                });
+            });
+
+            catalogs[id].forEach(function (episode) {
+                var season = use_tvdb ? episode.tvdb.season : index + 1;
+
+                (seasons[season] = seasons[season] || []).push({
+                    number: use_tvdb ? episode.tvdb.episode : episode.episode,
+                    aired: !!episode.aired,
+                    watched: !!watched[episode.episode],
+                    part: id,
+                    local: episode.episode
+                });
+            });
+        });
+
+        var list = PARTS_LIST_ORDER.filter(function (status) {
+            return present.indexOf(status) !== -1;
+        })[0] || null;
+
+        var merged = {
+            result: list ? true : false,
+            list: list,
+            last_watched_at: last_watched_at,
+            episodes_watched: 0,
+            episodes_aired: 0,
+            episodes_total: 0,
+            seasons: [],
+            merged: true,
+            // Где остановился — самая дальняя отмеченная серия сериала целиком
+            last_code: ''
+        };
+
+        Object.keys(seasons).map(Number).sort(function (a, b) { return a - b; }).forEach(function (number) {
+            var episodes = seasons[number].sort(function (a, b) { return a.number - b.number; });
+
+            episodes.forEach(function (episode) {
+                merged.episodes_total++;
+                if (episode.aired) merged.episodes_aired++;
+
+                if (episode.watched) {
+                    merged.episodes_watched++;
+                    merged.last_code = episodeCode({ season: number, episode: episode.number });
+                }
+            });
+
+            merged.seasons.push({ number: number, episodes: episodes });
+        });
+
+        return merged;
+    }
+
+    function mergedShow(parts, done) {
+        var catalogs = {};
+        var answers = null;
+        var waiting = parts.length + 1;
+
+        function step() {
+            if (--waiting) return;
+            done(assemble(parts, catalogs, answers));
+        }
+
+        parts.forEach(function (id) {
+            fetchPartEpisodes(id, function (list) {
+                catalogs[id] = list;
+                step();
+            });
+        });
+
+        api({
+            path: '/sync/watched?extended=episodes,counters',
+            method: 'POST',
+            auth: true,
+            body: parts.map(function (id) { return { simkl: id }; }),
+            onDone: function (data) {
+                answers = Array.isArray(data) ? data : [];
+                step();
+            },
+            onFail: function () {
+                answers = [];
+                step();
+            }
+        });
+    }
+
+    // Ответ /sync/watched по tmdb-id сериала, а если это аниме из нескольких
+    // частей — сериал, собранный из всех частей. Первая часть может и не быть
+    // в списках, когда смотрят вторую, поэтому части ищем при любом ответе,
+    // где Simkl узнал тайтл.
+    function withParts(method, tmdb, answer, done) {
+        if (method !== 'tv' || !answer || !answer.simkl) return done(answer);
+
+        animeParts(tmdb, answer.simkl, function (parts) {
+            if (!parts) return done(answer);
+            mergedShow(parts, done);
+        });
+    }
+
     // --- Запись в Simkl ---------------------------------------------------
 
     // Simkl ищет тайтл по всем переданным полям сразу, поэтому отдаём и
@@ -861,7 +1145,7 @@
     function rejected(data) {
         var missing = (data && data.not_found) || {};
 
-        return ['movies', 'shows', 'episodes'].some(function (kind) {
+        return ['movies', 'shows', 'anime', 'episodes'].some(function (kind) {
             return (missing[kind] || []).length > 0;
         });
     }
@@ -869,16 +1153,18 @@
     // Отметка о просмотре — это событие, а не членство в списке, поэтому идёт
     // в /sync/history. Форма тела задаёт глубину: status без seasons — весь
     // сериал, seasons с episodes — перечисленные серии.
-    function sendHistory(ctx, extra, done_text) {
+    // body — готовое тело запроса, когда оно не про сериал по tmdb-id целиком,
+    // а про отдельные части аниме.
+    function sendHistory(ctx, extra, done_text, body) {
         // Поштучно шлём только непросмотренные серии, так что ноль в
         // added.episodes здесь — это отказ, а не «уже было отмечено»
-        var expects_episodes = !!(extra && extra.seasons);
+        var expects_episodes = !!(extra && extra.seasons) || !!(body && body.anime);
 
         api({
             path: '/sync/history',
             method: 'POST',
             auth: true,
-            body: mediaBody(ctx.card, ctx.method, extra),
+            body: body || mediaBody(ctx.card, ctx.method, extra),
             onDone: function (data) {
                 if (rejected(data)) return Lampa.Noty.show('Simkl: тайтл не найден');
 
@@ -913,7 +1199,13 @@
         ((status && status.seasons) || []).forEach(function (season) {
             (season.episodes || []).forEach(function (episode) {
                 if (episode.aired && !episode.watched) {
-                    list.push({ season: season.number, episode: episode.number });
+                    // part и local есть только у аниме, собранного из частей
+                    list.push({
+                        season: season.number,
+                        episode: episode.number,
+                        part: episode.part,
+                        local: episode.local
+                    });
                 }
             });
         });
@@ -934,26 +1226,43 @@
     // Выбранная серия отмечается вместе со всеми непросмотренными до неё:
     // досмотрел до S02E05 — значит, и всё раньше тоже. Уже отмеченные повторно
     // не шлём, иначе Simkl засчитал бы их пересмотром.
+    //
+    // У аниме из нескольких частей отмечаем каждую часть отдельно, её
+    // собственной нумерацией: так серия попадает ровно туда, откуда её взяли,
+    // и не зависит от того, как Simkl разметил части по сезонам TVDB.
     function markUpTo(ctx, unwatched, index) {
-        var by_season = {};
-        var order = [];
+        var chosen = unwatched.slice(0, index + 1);
+        var count = index + 1;
+        var text = 'отмечено до ' + episodeCode(unwatched[index]) +
+            (count > 1 ? ' (' + count + ' ' + episodesNominative(count) + ')' : '');
 
-        unwatched.slice(0, index + 1).forEach(function (place) {
-            if (!by_season[place.season]) {
-                by_season[place.season] = [];
-                order.push(place.season);
+        var groups = {};
+        var order = [];
+        var by_parts = !!chosen[0].part;
+
+        chosen.forEach(function (place) {
+            var key = by_parts ? place.part : place.season;
+
+            if (!groups[key]) {
+                groups[key] = [];
+                order.push(key);
             }
-            by_season[place.season].push({ number: place.episode });
+            groups[key].push({ number: by_parts ? place.local : place.episode });
         });
 
-        var count = index + 1;
+        if (by_parts) {
+            return sendHistory(ctx, null, text, {
+                anime: order.map(function (part) {
+                    return { ids: { simkl: part }, episodes: groups[part] };
+                })
+            });
+        }
 
         sendHistory(ctx, {
             seasons: order.map(function (number) {
-                return { number: number, episodes: by_season[number] };
+                return { number: number, episodes: groups[number] };
             })
-        }, 'отмечено до ' + episodeCode(unwatched[index]) +
-            (count > 1 ? ' (' + count + ' ' + episodesNominative(count) + ')' : ''));
+        }, text);
     }
 
     function openUnwatchedMenu(ctx, unwatched, back) {
@@ -1054,6 +1363,13 @@
                     if (chosen.open) return openOnSimkl(ctx);
 
                     if (chosen.whole) {
+                        // status: completed по tmdb-id закрыл бы у аниме только
+                        // первую часть, поэтому у собранного из частей отмечаем
+                        // все непросмотренные серии поштучно
+                        if (status && status.seasons && unwatched.length && unwatched[0].part) {
+                            return markUpTo(ctx, unwatched, unwatched.length - 1);
+                        }
+
                         sendHistory(ctx, { status: 'completed' }, 'сериал отмечен просмотренным');
                     }
                 },
@@ -1487,8 +1803,27 @@
                 var last = furthestWatched(row.item, row.type === 'anime');
                 var progress = row.watched + ' из ' + row.aired;
 
-                return rowEntry(row, function (card) {
-                    return [last, progress, airDate(card.last_air_date)].filter(Boolean).join(' · ');
+                if (row.type !== 'anime') {
+                    return rowEntry(row, function (card) {
+                        return [last, progress, airDate(card.last_air_date)].filter(Boolean).join(' · ');
+                    });
+                }
+
+                // Запись аниме в корзине — это одна часть, а карточка TMDB —
+                // сериал целиком. Если он собран из нескольких частей, подпись
+                // берём у всего сериала, как на карточке: иначе у «Slay the
+                // Gods» здесь стояло бы «0 из 15» второй части, а там «15 из 30».
+                return rowEntry(row, function (card, done) {
+                    var date = airDate(card.last_air_date);
+
+                    fetchStatus('tv', card.id, function (status) {
+                        if (status && status.merged) {
+                            var whole = status.episodes_watched + ' из ' + status.episodes_aired;
+                            return done([status.last_code, whole, date].filter(Boolean).join(' · '));
+                        }
+
+                        done([last, progress, date].filter(Boolean).join(' · '));
+                    });
                 });
             }));
         }, fail);
@@ -1654,23 +1989,37 @@
         var waiting = slice.length;
         var section = labels[url] || (labels[url] = {});
 
+        function next() {
+            if (--waiting) return;
+
+            var ready_list = results.filter(Boolean);
+            if (ready_list.length) done(ready_list);
+            else fail();
+        }
+
         slice.forEach(function (item, index) {
             tmdbCard(item.method, item.tmdb, function (card) {
+                if (!card) return next();
+
                 // Порядок важен — он и есть сортировка, — поэтому кладём по
                 // индексу, а не по мере возвращения ответов.
-                if (card) {
-                    results[index] = card;
-                    var label = typeof item.label === 'function' ? item.label(card) : item.label;
+                results[index] = card;
+
+                resolveLabel(item, card, function (label) {
                     if (label) section[card.id] = label;
-                }
-
-                if (--waiting) return;
-
-                var ready_list = results.filter(Boolean);
-                if (ready_list.length) done(ready_list);
-                else fail();
+                    next();
+                });
             });
         });
+    }
+
+    // Подпись бывает готовой строкой, функцией от карточки или функцией,
+    // которой нужен ещё запрос, — тогда она отвечает через callback
+    function resolveLabel(item, card, done) {
+        if (typeof item.label !== 'function') return done(item.label);
+        if (item.label.length > 1) return item.label(card, done);
+
+        done(item.label(card));
     }
 
     function openSection(url, title) {
@@ -1810,6 +2159,7 @@
         loadCache();
         loadCards();
         loadAnimeTmdb();
+        loadParts();
         addSettings();
 
         if (!configured()) {

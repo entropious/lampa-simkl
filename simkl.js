@@ -312,6 +312,7 @@
     // Номер в ключе меняется, когда в карточке появляется новое поле: иначе
     // вечный кэш так и отдавал бы карточки без него
     var CARDS_KEY = 'simkl_cards_v2';
+    var ANIME_TMDB_KEY = 'simkl_anime_tmdb';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -1284,10 +1285,95 @@
     }
 
     // Запись раздела: что открыть и что подписать под постером. Без tmdb-id
-    // карточку не собрать, такие записи просто выпадают.
-    function entry(method, ids, label) {
+    // карточку не собрать. Аниме без него ещё можно найти по simkl-id (см.
+    // resolveAnime), остальное просто выпадает.
+    function entry(method, ids, label, anime) {
         var tmdb = Number(ids && ids.tmdb);
-        return tmdb ? { method: method, tmdb: tmdb, label: label } : null;
+        var simkl = ids && (ids.simkl || ids.simkl_id);
+
+        if (tmdb) return { method: method, tmdb: tmdb, label: label };
+        if (anime && simkl) return { method: method, tmdb: 0, simkl: simkl, label: label };
+
+        return null;
+    }
+
+    // Продолжения аниме Simkl, как MyAnimeList, заводит отдельными тайтлами:
+    // «Slay The Gods 2», «Dorohedoro Season 2». В TMDB это сезоны одного
+    // сериала, и в списке у такой записи tmdb-id нет. В деталях он бывает
+    // прямо в ids, а если нет — есть у предыдущей части в relations. Карточку
+    // в любом случае открываем у сериала целиком.
+    var anime_tmdb = {};
+
+    function loadAnimeTmdb() {
+        try {
+            anime_tmdb = Lampa.Storage.get(ANIME_TMDB_KEY, '{}') || {};
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать сопоставления аниме', e);
+        }
+    }
+
+    function parentTmdb(data) {
+        var own = Number(data && data.ids && data.ids.tmdb);
+        if (own) return own;
+
+        var related = (data && data.relations) || [];
+
+        for (var i = 0; i < related.length; i++) {
+            var kind = String(related[i].relation_type || '');
+            var tmdb = Number(related[i].ids && related[i].ids.tmdb);
+
+            // Только предыдущие части того же сериала: сиквел, спин-офф или
+            // полнометражка — это уже другой тайтл в TMDB
+            var same_show = kind === 'prequel' || kind.indexOf('season') === 0;
+
+            if (tmdb && same_show && related[i].anime_type !== 'movie') return tmdb;
+        }
+
+        return 0;
+    }
+
+    function resolveAnime(list, done) {
+        var missing = list.filter(function (item) { return !item.tmdb && item.simkl; });
+        var waiting = missing.length;
+
+        if (!waiting) return done(list);
+
+        // Сопоставление не меняется, поэтому помним его навсегда. Ненайденное
+        // не запоминаем: Simkl может проставить связь позже.
+        function finish() {
+            if (--waiting) return;
+
+            try {
+                Lampa.Storage.set(ANIME_TMDB_KEY, anime_tmdb);
+            } catch (e) {
+                console.error('Simkl: не удалось записать сопоставления аниме', e);
+            }
+
+            done(list);
+        }
+
+        missing.forEach(function (item) {
+            if (anime_tmdb[item.simkl]) {
+                item.tmdb = anime_tmdb[item.simkl];
+                return finish();
+            }
+
+            api({
+                path: '/anime/' + encodeURIComponent(item.simkl) + '?extended=full',
+                auth: true,
+                onDone: function (data) {
+                    var tmdb = parentTmdb(data);
+
+                    if (tmdb) {
+                        anime_tmdb[item.simkl] = tmdb;
+                        item.tmdb = tmdb;
+                    }
+
+                    finish();
+                },
+                onFail: finish
+            });
+        });
     }
 
     // Аниме у Simkl — отдельная корзина, не часть сериалов: /sync/all-items/shows
@@ -1335,7 +1421,7 @@
     }
 
     function rowEntry(row, label) {
-        return entry(rowMethod(row), rowMedia(row).ids, label);
+        return entry(rowMethod(row), rowMedia(row).ids, label, row.type === 'anime');
     }
 
     function byDateDesc(field) {
@@ -1349,7 +1435,11 @@
     // времени, и после отметки задним числом оно показывает не туда —
     // «Вальхалла» с двумя досмотренными сезонами числилась на S01E08. С
     // extended=full в seasons приходят именно отмеченные серии.
-    function furthestWatched(item) {
+    //
+    // У аниме сезон не пишем: каждое продолжение у Simkl — отдельная запись со
+    // своей нумерацией с первого сезона, и «S01E05» у второй части вводило бы
+    // в заблуждение. Остаётся номер серии внутри части.
+    function furthestWatched(item, anime) {
         var best = null;
 
         (item.seasons || []).forEach(function (season) {
@@ -1364,7 +1454,9 @@
             });
         });
 
-        return best ? episodeCode(best) : item.last_watched;
+        if (!best) return anime ? '' : item.last_watched;
+
+        return episodeCode(anime ? { episode: best.episode } : best);
     }
 
     // Всё, что в «Смотрю» или «Отложено» и где остались вышедшие непросмотренные
@@ -1392,7 +1484,7 @@
             // вышедшего посмотрено и когда вышла последняя серия. Дата есть
             // только в карточке TMDB, поэтому подпись собирается, когда та приехала.
             done(rows.map(function (row) {
-                var last = furthestWatched(row.item);
+                var last = furthestWatched(row.item, row.type === 'anime');
                 var progress = row.watched + ' из ' + row.aired;
 
                 return rowEntry(row, function (card) {
@@ -1459,7 +1551,7 @@
                 if (data && data.error) return fail();
 
                 done(((data && data.items) || []).map(function (item) {
-                    return entry(item.type === 'movie' ? 'movie' : 'tv', item.ids);
+                    return entry(item.type === 'movie' ? 'movie' : 'tv', item.ids, null, item.type === 'anime');
                 }));
             },
             onFail: fail
@@ -1471,9 +1563,21 @@
         if (hit && Date.now() - hit.at < ENTRIES_TTL) return done(hit.entries);
 
         function store(list) {
-            var clean = list.filter(Boolean);
-            entries_cache[url] = { at: Date.now(), entries: clean };
-            done(clean);
+            resolveAnime(list.filter(Boolean), function (resolved) {
+                // Два сезона одного аниме сводятся к одной карточке TMDB —
+                // показываем её один раз, по первой, то есть свежей, записи
+                var seen = {};
+                var clean = resolved.filter(function (item) {
+                    var key = item.method + ':' + item.tmdb;
+                    if (!item.tmdb || seen[key]) return false;
+
+                    seen[key] = true;
+                    return true;
+                });
+
+                entries_cache[url] = { at: Date.now(), entries: clean };
+                done(clean);
+            });
         }
 
         if (url === 'unfinished') return loadUnfinished(store, fail);
@@ -1705,6 +1809,7 @@
     function startPlugin() {
         loadCache();
         loadCards();
+        loadAnimeTmdb();
         addSettings();
 
         if (!configured()) {

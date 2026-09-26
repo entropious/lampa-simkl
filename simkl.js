@@ -299,7 +299,6 @@
     // списки, которые пользователь собрал сам, они и так попадают в «Мои».
     // «Понравившимся спискам» Trakt у Simkl соответствуют отслеживаемые.
     var SECTIONS = [
-        { id: 'next', title: 'Смотреть дальше' },
         { id: 'unfinished', title: 'Продолжить просмотр' },
         { id: 'plan', title: 'Буду смотреть' },
         { id: 'lists', title: 'Мои списки', lists: true },
@@ -748,7 +747,7 @@
         dropCache(key);
         delete episodes_cache[key];
 
-        // Отметка сдвигает «Смотреть дальше», смена статуса — «Буду смотреть»,
+        // Отметка сдвигает «Продолжить просмотр», смена статуса — «Буду смотреть»,
         // так что собранные разделы после любой записи уже неверны
         entries_cache = {};
     }
@@ -1265,11 +1264,6 @@
 
     var user_id = null;
 
-    function episodeLabel(next) {
-        var code = episodeCode(next);
-        return next.title ? code + ' · ' + next.title : code;
-    }
-
     // TMDB отдаёт дату выхода без времени, «2026-07-26». Через new Date её не
     // пропускаем: полночь по UTC западнее Гринвича превращается в предыдущий день.
     function airDate(value) {
@@ -1350,21 +1344,6 @@
         };
     }
 
-    function loadNext(done, fail) {
-        var paths = [
-            'shows/watching?extended=full&next_watch_info=yes',
-            'anime/watching?extended=full&next_watch_info=yes'
-        ];
-
-        fetchBuckets(paths, function (rows) {
-            rows = rows.filter(function (row) { return row.item.next_to_watch_info; });
-
-            done(sortByNext(rows).map(function (row) {
-                return rowEntry(row, episodeLabel(row.item.next_to_watch_info));
-            }));
-        }, fail);
-    }
-
     // Где остановился — самая дальняя отмеченная серия. Готовое поле
     // last_watched для этого не годится: это серия, отмеченная последней по
     // времени, и после отметки задним числом оно показывает не туда —
@@ -1388,9 +1367,8 @@
         return best ? episodeCode(best) : item.last_watched;
     }
 
-    // Начатое и не досмотренное: есть просмотренные серии и есть вышедшие
-    // непросмотренные. Отложенное сюда тоже входит — оно ровно такое. От
-    // «Смотреть дальше» раздел отличается тем, что там есть и ещё не начатое.
+    // Всё, что в «Смотрю» или «Отложено» и где остались вышедшие непросмотренные
+    // серии — в том числе ещё не начатое: в «Смотрю» оно стоит не просто так.
     function loadUnfinished(done, fail) {
         var paths = [
             'shows/watching?extended=full', 'shows/hold?extended=full',
@@ -1404,9 +1382,10 @@
                 row.watched = item.watched_episodes_count || 0;
                 row.aired = (item.total_episodes_count || 0) - (item.not_aired_episodes_count || 0);
 
-                return row.watched > 0 && row.watched < row.aired;
+                return row.watched < row.aired;
             });
 
+            // Не начатое без даты просмотра уходит в конец само
             rows.sort(byDateDesc('last_watched_at'));
 
             // «S02E08 · 10 из 16 · 26.07.26»: где остановился, сколько из
@@ -1497,7 +1476,6 @@
             done(clean);
         }
 
-        if (url === 'next') return loadNext(store, fail);
         if (url === 'unfinished') return loadUnfinished(store, fail);
         if (url === 'plan') return loadPlan(store, fail);
         if (String(url).indexOf('list:') === 0) return loadList(url.slice(5), store, fail);
@@ -1505,27 +1483,9 @@
         fail();
     }
 
-    // Сначала то, что уже вышло и ждёт просмотра, свежее сверху; потом сериалы,
-    // чья следующая серия ещё не вышла. Иначе анонсы будущих серий оттеснили бы
-    // вниз ровно то, ради чего экран и открывают.
-    function sortByNext(rows) {
-        var now = Date.now();
-
-        return rows.slice().sort(function (a, b) {
-            var at = Date.parse(a.item.next_to_watch_info.date) || 0;
-            var bt = Date.parse(b.item.next_to_watch_info.date) || 0;
-            var a_aired = at <= now;
-            var b_aired = bt <= now;
-
-            if (a_aired !== b_aired) return a_aired ? -1 : 1;
-            return a_aired ? bt - at : at - bt;
-        });
-    }
-
     // Подпись под постером — единственное, чего нет у родной карточки: там
     // стоит год, и пересчитывает его она сама, так что подсунуть текст через
-    // данные нельзя. Держим подписи отдельно, по разделам — у одного сериала
-    // в «Смотреть дальше» и в «Продолжить просмотр» они разные, — и проставляем после
+    // данные нельзя. Держим подписи отдельно, по разделам, и проставляем после
     // отрисовки, находя карточку по её же card_data.
     var labels = {};
 

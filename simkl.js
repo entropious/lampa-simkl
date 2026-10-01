@@ -317,6 +317,8 @@
     var ANIME_TMDB_KEY = 'simkl_anime_tmdb';
     var PARTS_KEY = 'simkl_anime_parts';
     var RECS_KEY = 'simkl_recs';
+    var LAUNCHES_KEY = 'simkl_launches';
+    var AUTOMARK_KEY = 'simkl_automark';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -1357,7 +1359,11 @@
                 items.push({ title: 'Отметить сезон…', seasons: true });
             }
 
-            items.push({ title: 'Весь сериал просмотрен', whole: true });
+            // Весь сериал — это все вышедшие непросмотренные серии поштучно.
+            // status: completed отметил бы заново и уже просмотренные, а
+            // повторный просмотр засчитывать нельзя. Нечего отмечать — нет и
+            // пункта.
+            if (unwatched.length) items.push({ title: 'Весь сериал просмотрен', whole: true });
             items.push({ title: 'Открыть на Simkl', open: true });
 
             Lampa.Select.show({
@@ -1371,20 +1377,349 @@
 
                     if (chosen.open) return openOnSimkl(ctx);
 
-                    if (chosen.whole) {
-                        // status: completed по tmdb-id закрыл бы у аниме только
-                        // первую часть, поэтому у собранного из частей отмечаем
-                        // все непросмотренные серии поштучно
-                        if (status && status.seasons && unwatched.length && unwatched[0].part) {
-                            return markUpTo(ctx, unwatched, unwatched.length - 1);
-                        }
-
-                        sendHistory(ctx, { status: 'completed' }, 'сериал отмечен просмотренным');
-                    }
+                    if (chosen.whole) markUpTo(ctx, unwatched, unwatched.length - 1);
                 },
                 onBack: function () { Lampa.Controller.toggle(back); }
             });
         });
+    }
+
+    // --- Кнопка на фильме ----------------------------------------------------
+
+    // У фильма выбирать нечего, кроме «посмотрел или нет», но делать это через
+    // «Избранное» неочевидно — поэтому кнопка та же, что у сериала.
+    function openMovieMenu(ctx) {
+        if (!configured()) return Lampa.Noty.show('Simkl: не задан client_id');
+        if (!token()) return startPinAuth(function () { refresh(ctx); });
+
+        var back = Lampa.Controller.enabled().name;
+
+        fetchStatus(ctx.method, ctx.card.id, function (status) {
+            var watched = movieWatched(status);
+            var items = [];
+
+            if (watched) items.push({ title: 'Убрать отметку о просмотре', unmark: true });
+            else items.push({ title: 'Фильм просмотрен', mark: true });
+
+            items.push({ title: 'Открыть на Simkl', open: true });
+
+            Lampa.Select.show({
+                title: 'Simkl',
+                items: items,
+                onSelect: function (chosen) {
+                    Lampa.Controller.toggle(back);
+
+                    if (chosen.open) return openOnSimkl(ctx);
+                    if (chosen.mark) return sendHistory(ctx, null, 'фильм отмечен просмотренным');
+                    if (chosen.unmark) unmarkMovie(ctx);
+                },
+                onBack: function () { Lampa.Controller.toggle(back); }
+            });
+        });
+    }
+
+    // Фильм смотрели, если он в «Просмотрено» или у него есть дата просмотра:
+    // его могли досмотреть и перенести в другой список. Повторная отметка
+    // такого — пересмотр, а его не засчитываем нигде.
+    function movieWatched(status) {
+        return !!status && (status.list === 'completed' || !!status.last_watched_at);
+    }
+
+    function unmarkMovie(ctx) {
+        api({
+            path: '/sync/history/remove',
+            method: 'POST',
+            auth: true,
+            body: mediaBody(ctx.card, ctx.method, null),
+            onDone: function () {
+                invalidate(ctx.method, ctx.card.id);
+                Lampa.Noty.show('Simkl: отметка о просмотре снята');
+                refresh(ctx);
+            },
+            onFail: function () {
+                Lampa.Noty.show('Simkl: не удалось снять отметку');
+            }
+        });
+    }
+
+    // --- Автоотметка ---------------------------------------------------------
+
+    // Во встроенном плеере просмотрено — это больше 90% длительности: на
+    // титрах человек обычно закрывает плеер, и 100% не бывает почти никогда.
+    var WATCHED_PERCENT = 90;
+
+    // Запуски встроенного плеера помним полдня: серию на паузе досматривают
+    // вечером, а Lampa за это время могла и перезагрузиться
+    var LAUNCH_TTL = 12 * 60 * 60 * 1000;
+
+    var launches = {};
+    var by_hash = {};
+
+    function automark() {
+        return Lampa.Storage.get(AUTOMARK_KEY, true) && ready();
+    }
+
+    function loadLaunches() {
+        try {
+            var saved = Lampa.Storage.get(LAUNCHES_KEY, '{}') || {};
+
+            Object.keys(saved).forEach(function (id) {
+                if (saved[id] && Date.now() - saved[id].at < LAUNCH_TTL) indexLaunch(saved[id]);
+            });
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать запуски', e);
+        }
+    }
+
+    function persistLaunches() {
+        var keep = {};
+
+        Object.keys(launches).forEach(function (id) {
+            if (Date.now() - launches[id].at < LAUNCH_TTL) keep[id] = launches[id];
+        });
+
+        launches = keep;
+
+        try {
+            Lampa.Storage.set(LAUNCHES_KEY, launches);
+        } catch (e) {
+            console.error('Simkl: не удалось записать запуски', e);
+        }
+    }
+
+    function indexLaunch(entry) {
+        launches[entry.id] = entry;
+        if (entry.hash) by_hash[entry.hash] = entry;
+    }
+
+    // Lampa хранит прогресс под хэшем от сезона, серии и оригинального
+    // названия — так его считают и балансеры, и торренты. Обратного хода нет,
+    // поэтому перебираем серии сериала и смотрим, чей хэш совпал.
+    var hash_places = {};
+
+    function episodeHash(card, season, episode) {
+        return Lampa.Utils.hash([season, season > 10 ? ':' : '', episode, card.original_name || card.original_title].join(''));
+    }
+
+    function placeByHash(card, hash) {
+        var key = card.id;
+
+        if (!hash_places[key]) {
+            var map = {};
+            var seasons = (card.seasons || []).filter(function (season) {
+                return season.season_number > 0 && season.episode_count > 0;
+            });
+
+            // Без разбивки по сезонам — с запасом: хэш дешёвый
+            if (!seasons.length) {
+                for (var n = 1; n <= 30; n++) seasons.push({ season_number: n, episode_count: 120 });
+            }
+
+            seasons.forEach(function (season) {
+                for (var e = 1; e <= season.episode_count; e++) {
+                    map[episodeHash(card, season.season_number, e)] = { season: season.season_number, episode: e };
+                }
+            });
+
+            hash_places[key] = map;
+        }
+
+        return hash_places[key][hash] || null;
+    }
+
+    function itemPlace(card, method, item) {
+        if (method !== 'tv') return {};
+
+        var season = Number(item.season);
+        var episode = Number(item.episode);
+        if (season && episode) return { season: season, episode: episode };
+
+        var hash = item.timeline && item.timeline.hash;
+        return hash ? placeByHash(card, hash) : null;
+    }
+
+    // Карточку плеер получает не всегда: тогда берём ту, с которой его открыли
+    function playCard(data) {
+        if (data.card && data.card.id) return data.card;
+        if (data.movie && data.movie.id) return data.movie;
+
+        var active = Lampa.Activity.active();
+        if (!active) return null;
+
+        return (active.card && active.card.id && active.card) ||
+            (active.movie && active.movie.id && active.movie) || null;
+    }
+
+    // В Storage кладём только то, что нужно для отметки
+    function launchCard(card) {
+        return {
+            id: card.id,
+            title: card.title,
+            name: card.name,
+            original_title: card.original_title,
+            original_name: card.original_name,
+            release_date: card.release_date,
+            first_air_date: card.first_air_date
+        };
+    }
+
+    function launchEntry(card, method, place) {
+        return {
+            id: method + ':' + card.id + ':' + (method === 'tv' ? place.season + ':' + place.episode : 'movie'),
+            at: Date.now(),
+            card: launchCard(card),
+            method: method,
+            season: place.season,
+            episode: place.episode,
+            done: false
+        };
+    }
+
+    // Встроенный плеер открыли — запоминаем каждую серию плейлиста под её
+    // хэшем прогресса: досмотреть могут и не ту, с которой начали
+    function registerPlay(data) {
+        if (!automark() || !data) return;
+
+        var card = playCard(data);
+        if (!card || !Number(card.id)) return;
+
+        var method = Core.cardMethod(card);
+        var items = [data].concat(Array.isArray(data.playlist) ? data.playlist : []);
+
+        items.forEach(function (item) {
+            var hash = item && item.timeline && item.timeline.hash;
+            if (!hash) return;
+
+            var place = itemPlace(card, method, item);
+            if (!place) return;
+
+            var entry = launchEntry(card, method, place);
+            var known = launches[entry.id];
+
+            // Повторный запуск недосмотренной серии продолжает прежний
+            if (known && !known.done) entry = known;
+
+            entry.at = Date.now();
+            entry.hash = hash;
+            indexLaunch(entry);
+        });
+
+        persistLaunches();
+    }
+
+    // Внешний плеер о прогрессе ничего не сообщает — на macOS и iOS Lampa
+    // открывает его ссылкой и больше ничего о нём не знает. Поэтому серия или
+    // фильм отмечаются сразу при открытии. Только запущенная серия: что из
+    // плейлиста досмотрят дальше, неизвестно.
+    //
+    // На Android так не делаем: там внешний плеер возвращает позицию в
+    // Timeline, и работает то же правило 90%, что и во встроенном.
+    function externalPlay(data) {
+        if (!automark() || !data) return;
+        if (isAndroid()) return registerPlay(data);
+
+        var card = playCard(data);
+        if (!card || !Number(card.id)) return;
+
+        var method = Core.cardMethod(card);
+        var place = itemPlace(card, method, data);
+
+        if (!place) return console.warn('Simkl: не удалось понять, какая серия запущена');
+
+        markWatched(launchEntry(card, method, place));
+    }
+
+    function isAndroid() {
+        try {
+            return Lampa.Platform.is('android');
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function progress(entry, percent) {
+        if (!entry || entry.done || !(percent > WATCHED_PERCENT)) return;
+
+        entry.done = true;
+        persistLaunches();
+        markWatched(entry);
+    }
+
+    function entryCtx(entry) {
+        var current = Core.currentCard();
+
+        if (current && String(current.card.id) === String(entry.card.id)) return current;
+
+        return { card: entry.card, method: entry.method, render: $() };
+    }
+
+    // Отмечаем только эту серию: в отличие от меню, где выбранная серия тянет
+    // за собой все предыдущие, здесь известно ровно одно — её смотрели.
+    // Уже отмеченное повторно не шлём, иначе Simkl посчитал бы пересмотр.
+    // Смотрели ли уже — решает только Simkl: перед отметкой статус берётся
+    // свежим, мимо кэша
+    function markWatched(entry) {
+        var ctx = entryCtx(entry);
+
+        if (entry.method !== 'tv') {
+            dropCache(cacheKey('movie', entry.card.id));
+
+            return fetchStatus('movie', entry.card.id, function (status) {
+                if (movieWatched(status)) return;
+                sendHistory(ctx, null, 'фильм отмечен просмотренным');
+            });
+        }
+
+        var code = episodeCode({ season: entry.season, episode: entry.episode });
+
+        delete episodes_cache[cacheKey('tv', entry.card.id)];
+
+        fetchEpisodes(ctx, function (status) {
+            var place = null;
+
+            ((status && status.seasons) || []).forEach(function (season) {
+                if (season.number !== entry.season) return;
+
+                (season.episodes || []).forEach(function (episode) {
+                    if (episode.number === entry.episode) place = episode;
+                });
+            });
+
+            if (place && place.watched) return;
+
+            if (place && place.part) {
+                return sendHistory(ctx, null, 'отмечено ' + code, {
+                    anime: [{ ids: { simkl: place.part }, episodes: [{ number: place.local }] }]
+                });
+            }
+
+            sendHistory(ctx, {
+                seasons: [{ number: entry.season, episodes: [{ number: entry.episode }] }]
+            }, 'отмечено ' + code);
+        });
+    }
+
+    // Прогресс встроенного плеера, а на Android — и внешнего: Lampa пишет его
+    // в Timeline под хэшем серии
+    function followTimeline() {
+        if (!Lampa.Timeline || !Lampa.Timeline.listener) return;
+
+        Lampa.Timeline.listener.follow('update', function (e) {
+            var data = e && e.data;
+            if (!data || !data.road || !automark()) return;
+
+            progress(by_hash[data.hash], Number(data.road.percent) || 0);
+        });
+    }
+
+    function startAutomark() {
+        loadLaunches();
+        followTimeline();
+
+        if (!Lampa.Player || !Lampa.Player.listener) return;
+
+        Lampa.Player.listener.follow('start', registerPlay);
+        Lampa.Player.listener.follow('external', externalPlay);
     }
 
     // --- Категории «Избранного» -------------------------------------------
@@ -1453,16 +1788,18 @@
     function onCard(ctx) {
         if (!configured()) return;
 
-        // Кнопка нужна только сериалу: у него надо выбрать, что именно
-        // отмечено — серия, сезон или всё целиком. Фильму хватает категорий
-        // родного «Избранного», там выбирать нечего.
-        if (ctx.method === 'tv' && Lampa.Storage.get(BUTTON_KEY, true)) {
+        // У сериала в меню выбирают, что отмечено — серия, сезон или всё
+        // целиком, у фильма — просмотрен он или нет
+        if (Lampa.Storage.get(BUTTON_KEY, true)) {
             Core.cardButton(ctx, {
                 className: 'simkl-status-button',
                 icon: ICON,
                 title: 'Simkl',
                 after: '.button--play',
-                onEnter: function () { openEpisodeMenu(ctx); }
+                onEnter: function () {
+                    if (ctx.method === 'tv') openEpisodeMenu(ctx);
+                    else openMovieMenu(ctx);
+                }
             });
         }
 
@@ -2466,8 +2803,18 @@
             component: 'simkl',
             param: { name: BUTTON_KEY, type: 'trigger', default: true },
             field: {
-                name: 'Кнопка смены статуса',
-                description: 'Кнопка Simkl в ряду под постером'
+                name: 'Кнопка Simkl',
+                description: 'Кнопка в ряду под постером: отметки о просмотре'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'simkl',
+            param: { name: AUTOMARK_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Отмечать просмотренное',
+                description: 'Во встроенном плеере — когда просмотрено больше 90%, ' +
+                    'во внешнем — сразу при открытии'
             }
         });
     }
@@ -2479,6 +2826,7 @@
         loadParts();
         loadRecs();
         addSettings();
+        startAutomark();
 
         if (!configured()) {
             console.warn('Simkl: не задан CLIENT_ID, плагин ничего не покажет');

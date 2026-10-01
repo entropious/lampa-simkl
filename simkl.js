@@ -331,6 +331,21 @@
         '<path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.1 14.3-4-4 1.6-1.6 2.4 2.4 5.2-5.2 1.6 1.6-6.8 6.8z"></path>' +
         '</svg>';
 
+    // Иконки кнопки на карточке: подпись у второстепенных кнопок Lampa
+    // прячет, так что состояние видно только по ним. Просмотрено — круг с
+    // галочкой, как ICON; не смотрели — пустое кольцо; сериал начат, но не
+    // досмотрен — кольцо, залитое наполовину.
+    var BUTTON_ICONS = {
+        watched: ICON,
+        none: '<svg viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd">' +
+            '<path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16z"></path>' +
+            '</svg>',
+        started: '<svg viewBox="0 0 24 24" fill="currentColor" fill-rule="evenodd">' +
+            '<path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16z"></path>' +
+            '<path d="M12 6a6 6 0 0 0 0 12z"></path>' +
+            '</svg>'
+    };
+
     var STYLES = `
         .full-start-new__details.simkl-status-line { display: flex; align-items: center; }
         .simkl-status-line .simkl-icon { width: 1.1em; height: 1.1em; margin-right: 0.4em; flex-shrink: 0; }
@@ -829,9 +844,30 @@
             parts.join('<span class="full-start-new__split">●</span>'));
     }
 
+    // Фильм — просмотрен или нет. Сериал — ещё и начат: просмотрен он, когда
+    // в «Просмотрено» или отмечены все вышедшие серии, а начат — когда
+    // отмечена хоть одна.
+    function watchState(status, method) {
+        if (!status) return 'none';
+        if (method !== 'tv') return movieWatched(status) ? 'watched' : 'none';
+
+        var watched = status.episodes_watched || 0;
+        var aired = status.episodes_aired || status.episodes_total || 0;
+
+        if (status.list === 'completed' || (aired && watched >= aired)) return 'watched';
+        return watched > 0 ? 'started' : 'none';
+    }
+
     function renderButton(ctx, status) {
         var button = ctx.render.find('.simkl-status-button');
         if (!button.length) return;
+
+        var state = watchState(status, ctx.method);
+
+        if (button.attr('data-state') !== state) {
+            button.attr('data-state', state);
+            button.find('svg').replaceWith(BUTTON_ICONS[state]);
+        }
 
         button.find('span').text(status ? (LISTS[status.list] || 'В списке') : 'Simkl');
     }
@@ -845,12 +881,14 @@
 
         fetchStatus(ctx.method, ctx.card.id, function (status) {
             // Пока ходили в сеть, человек мог уйти на другую карточку —
-            // рисовать в её разметку чужой статус нельзя.
+            // рисовать в её разметку чужой статус нельзя. А мог и вернуться на
+            // эту: тогда рисуем в открытую сейчас, а не в ту, что была при
+            // запросе, — автоотметка запрашивает статус и вовсе без карточки.
             var current = Core.currentCard();
-            if (!current || current.card.id !== ctx.card.id) return;
+            if (!current || String(current.card.id) !== String(ctx.card.id)) return;
 
-            renderLine(ctx, status);
-            renderButton(ctx, status);
+            renderLine(current, status);
+            renderButton(current, status);
         });
     }
 
@@ -1793,7 +1831,8 @@
         if (Lampa.Storage.get(BUTTON_KEY, true)) {
             Core.cardButton(ctx, {
                 className: 'simkl-status-button',
-                icon: ICON,
+                // Пока статус не пришёл — как у непросмотренного
+                icon: BUTTON_ICONS.none,
                 title: 'Simkl',
                 after: '.button--play',
                 onEnter: function () {
@@ -2834,9 +2873,18 @@
 
         Lampa.Api.sources[SOURCE] = buildSource();
 
-        // Подписи со следующей серией проставляем, когда грид уже отрисован
+        // Подписи со следующей серией проставляем, когда грид уже отрисован.
+        // А при возврате на уже открытую карточку перечитываем статус: full
+        // при этом повторно не приходит, а статус мог измениться, пока были
+        // на другом экране, — например, фильм отметился в конце просмотра,
+        // запущенного из «Онлайн».
         Lampa.Listener.follow('activity', function (e) {
             if (e.type === 'complite') applyLabels();
+
+            if (e.type === 'start' && e.component === 'full') {
+                var ctx = Core.currentCard();
+                if (ctx) refresh(ctx);
+            }
         });
 
         // Lampa перерисовывает меню на старте и при смене профиля

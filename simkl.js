@@ -296,9 +296,9 @@
 
     // Панель — экран рядов, как родное «Избранное». Сверху «Продолжить
     // просмотр», за ним то, что ещё смотрят или собираются, — каруселями,
-    // отдельно по фильмам, сериалам и аниме. Просмотренное и брошенное —
-    // плитками в одной карусели, каждая открывает свой грид. Рекомендации —
-    // в самом низу. Персональных рекомендаций у Simkl в API нет, поэтому они
+    // отдельно по сериалам, аниме и фильмам. Дальше рекомендации, а в самом
+    // низу просмотренное и брошенное — плитками в одной карусели, каждая
+    // открывает свой грид. Персональных рекомендаций у Simkl в API нет, поэтому они
     // собираются из рекомендаций к каждому просмотренному сериалу — у TMDB и
     // у самого Simkl.
     // Фильмы ниже сериалов и аниме — и в рядах, и в плитках
@@ -2596,8 +2596,41 @@
             });
 
             list.sort(byDateDesc(status === 'plantowatch' ? 'added_to_watchlist_at' : 'last_watched_at'));
-            done(list.map(function (row) { return rowEntry(row); }));
+
+            var entries = list.map(function (row) { return rowEntry(row); });
+            if (status !== 'completed' || type === 'movies') return done(entries);
+
+            withoutContinued(type, entries, done, fail);
         }, fail);
+    }
+
+    // В «Просмотрено» нет сериала, у которого есть продолжение: досмотренный
+    // первый сезон «Дорохедоро» при втором в «Смотрю» — это сериал, который
+    // смотрят, а не закрытый. Сравниваем по карточке TMDB, когда части уже
+    // сведены к сериалу целиком (normalize).
+    function withoutContinued(type, entries, done, fail) {
+        var active = [];
+        var waiting = ACTIVE_STATUSES[type].length;
+
+        ACTIVE_STATUSES[type].forEach(function (status) {
+            loadEntries('library:' + type + ':' + status, function (list) {
+                active = active.concat(list);
+                next();
+            }, next);
+        });
+
+        function next() {
+            if (--waiting) return;
+
+            var busy = {};
+            active.forEach(function (item) { busy[item.method + ':' + item.tmdb] = true; });
+
+            normalize(entries.filter(Boolean), function (resolved) {
+                done(resolved.filter(function (item) {
+                    return !busy[item.method + ':' + item.tmdb];
+                }));
+            });
+        }
     }
 
     // --- Рекомендации --------------------------------------------------------
@@ -2987,19 +3020,23 @@
         }, fail);
     }
 
+    // Часть аниме — к сериалу целиком: по известному составу частей, а
+    // продолжение без tmdb-id — через resolveAnime
+    function normalize(list, done) {
+        list.forEach(function (item) {
+            var base = item.method === 'tv' && item.simkl && partsBase(item.simkl);
+            if (base) item.tmdb = base;
+        });
+
+        resolveAnime(list, done);
+    }
+
     function loadEntries(url, done, fail) {
         var hit = entries_cache[url];
         if (hit && Date.now() - hit.at < ENTRIES_TTL) return done(hit.entries);
 
         function store(list) {
-            list = list.filter(Boolean);
-
-            list.forEach(function (item) {
-                var base = item.method === 'tv' && item.simkl && partsBase(item.simkl);
-                if (base) item.tmdb = base;
-            });
-
-            resolveAnime(list, function (resolved) {
+            normalize(list.filter(Boolean), function (resolved) {
                 // Два сезона одного аниме сводятся к одной карточке TMDB —
                 // показываем её один раз, по первой, то есть свежей, записи
                 var seen = {};
@@ -3309,9 +3346,10 @@
             });
         });
 
-        parts.push(panelFolders);
-
         PANEL_RECS.forEach(function (row) { parts.push(panelRow(row.url, row.title)); });
+
+        // Просмотренное и брошенное — в самом низу, под рекомендациями
+        parts.push(panelFolders);
 
         return parts;
     }

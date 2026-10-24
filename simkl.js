@@ -2328,7 +2328,7 @@
     // карточку не собрать. Аниме без него ещё можно найти по simkl-id (см.
     // resolveAnime), остальное просто выпадает.
     function entry(method, ids, label, anime) {
-        var tmdb = Number(ids && ids.tmdb);
+        var tmdb = simklTmdb(ids, method);
         var simkl = ids && (ids.simkl || ids.simkl_id);
 
         // У аниме simkl-id нужен и при tmdb-id — по нему часть сводится к
@@ -2458,8 +2458,22 @@
     // Аниме-фильм в TMDB — фильм, всё остальное аниме — сериал
     function rowMethod(row) {
         if (row.type === 'movies') return 'movie';
-        if (row.type === 'anime' && row.item.anime_type === 'movie') return 'movie';
+        if (row.type === 'anime' && animeMovie(row.item.anime_type, rowMedia(row).ids)) return 'movie';
         return 'tv';
+    }
+
+    // Аниме, которое в TMDB — фильм. У аниме-фильмов и OVA Simkl кладёт
+    // tmdb-id не в tmdb, а в tmdbm — id фильма TMDB. У «Final Fantasy VII:
+    // Advent Children» тип ova, tmdb нет, а tmdbm — 647, и без этого поля
+    // плагин считал его сериалом без tmdb-id и не находил в списках.
+    function animeMovie(type, ids) {
+        return type === 'movie' || !!(ids && ids.tmdbm && !ids.tmdb);
+    }
+
+    // tmdb-id записи Simkl: у сериала — tmdb, у фильма — tmdb или tmdbm
+    function simklTmdb(ids, method) {
+        if (!ids) return 0;
+        return Number(ids.tmdb) || (method === 'movie' ? Number(ids.tmdbm) || 0 : 0);
     }
 
     function rowEntry(row, label) {
@@ -2580,7 +2594,8 @@
             var ids = rowMedia(row).ids || {};
 
             if (ids.simkl) keys['simkl:' + ids.simkl] = true;
-            if (Number(ids.tmdb)) keys[rowMethod(row) + ':' + Number(ids.tmdb)] = true;
+            var tmdb = simklTmdb(ids, rowMethod(row));
+            if (tmdb) keys[rowMethod(row) + ':' + tmdb] = true;
         });
 
         return keys;
@@ -2879,11 +2894,11 @@
 
     function simklRecItems(data) {
         return ((data && data.users_recommendations) || []).map(function (item) {
-            var movie = item.type === 'movie' || item.anime_type === 'movie';
+            var movie = item.type === 'movie' || animeMovie(item.anime_type, item.ids);
 
             return {
                 method: movie ? 'movie' : 'tv',
-                tmdb: Number(item.ids && item.ids.tmdb) || 0,
+                tmdb: simklTmdb(item.ids, movie ? 'movie' : 'tv'),
                 simkl: item.ids && item.ids.simkl
             };
         }).filter(function (item) {
@@ -3175,11 +3190,32 @@
         var active = Lampa.Activity.active();
         if (!active || active.source !== SOURCE || !active.activity) return;
 
-        var section = active.component === 'main' ? panelLabels() : labels[active.url];
-        if (!section) return;
-
         var root = active.activity.render();
         watchCards(root);
+
+        if (active.component !== 'main') return labelCards(root, labels[active.url]);
+
+        // На панели подписи у каждого ряда свои: карточка бывает в двух рядах
+        // сразу, и у «Ирмы Веп» в «Не совпадает с Simkl» должно стоять, что
+        // не совпало, а не «где остановился» из «Продолжить просмотр». Ряд
+        // узнаём по заголовку — Lampa рисует его из title, который мы отдали.
+        root.find('.items-line').each(function () {
+            var url = panel_titles[$(this).find('.items-line__title').text()];
+            if (url) labelCards($(this), rowLabels(url));
+        });
+    }
+
+    // У рядов списков Simkl своих подписей нет — у начатого берём «где
+    // остановился» из «Продолжить просмотр»
+    function rowLabels(url) {
+        var own = labels[url];
+        if (String(url).indexOf('library:') !== 0) return own;
+
+        return Object.assign({}, labels.unfinished || {}, own || {});
+    }
+
+    function labelCards(root, section) {
+        if (!section) return;
 
         root.find('.card').each(function () {
             var data = this.card_data;
@@ -3191,26 +3227,6 @@
                 age.text(label);
             }
         });
-    }
-
-    // На панели подписи всех рядов сразу. Карточка бывает в двух рядах —
-    // сериал из «Продолжить просмотр» лежит и в «Сериалы · Смотрю», — и
-    // подпись у неё одна: «где остановился» важнее года.
-    function panelLabels() {
-        var merged = {};
-        var order = ['unfinished'].concat(PANEL_RECS.map(function (row) { return row.url; }), Object.keys(labels));
-
-        order.forEach(function (url) {
-            if (String(url).indexOf('similar:') === 0) return;
-
-            var section = labels[url] || {};
-
-            Object.keys(section).forEach(function (id) {
-                if (!(id in merged)) merged[id] = section[id];
-            });
-        });
-
-        return merged;
     }
 
     // Ряды панели дорисовывают карточки, когда до них докручивают, и
@@ -3337,6 +3353,9 @@
     // у каждого ряда — открыть раздел гридом, — поэтому страниц у ряда не
     // меньше двух. Грид считает страницы сам, по настоящему числу записей.
     // Пустой ряд Lampa не рисует — достаточно ответить ничем.
+    // Заголовок ряда → его раздел: по нему applyLabels узнаёт ряд
+    var panel_titles = {};
+
     function panelRow(url, title) {
         return function (call) {
             loadEntries(url, function (entries) {
@@ -3344,8 +3363,11 @@
                 if (!slice.length) return call();
 
                 collect(url, slice, function (results) {
+                    var full = title + ' (' + entries.length + ')';
+                    panel_titles[full] = url;
+
                     call({
-                        title: title + ' (' + entries.length + ')',
+                        title: full,
                         results: results,
                         url: url,
                         source: SOURCE,

@@ -2604,6 +2604,60 @@
         }, fail);
     }
 
+    // «Смотрю» в «Избранном» Lampa, которого нет в «Смотрю» у Simkl. Счётчики
+    // расходятся по трём причинам, и подпись говорит, какая это: в Simkl
+    // тайтл лежит в другом списке (выгрузка его не трогает — статус могли
+    // поменять на simkl.com; фильм Simkl из «Смотрю» сам переводит в
+    // «Просмотрено»), его нет в Simkl вовсе или карточка не из TMDB.
+    var LIST_RANK = { watching: 0, hold: 1, plantowatch: 2, completed: 3, dropped: 4 };
+
+    function loadLampaOnly(done, fail) {
+        var cards = [];
+
+        try {
+            cards = (Lampa.Favorite.all().look || []).filter(function (card) { return card && Number(card.id); });
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать «Избранное»', e);
+        }
+
+        if (!cards.length) return done([]);
+
+        loadLibrary(function (rows) {
+            var entries = rows.map(function (row) {
+                var item = rowEntry(row);
+                if (item) item.status = row.item.status;
+                return item;
+            }).filter(Boolean);
+
+            normalize(entries, function (resolved) {
+                // У аниме из частей статус сериала — самый «живой» из частей
+                var status = {};
+
+                resolved.forEach(function (item) {
+                    if (!item.tmdb) return;
+
+                    var key = item.method + ':' + item.tmdb;
+                    if (!(key in status) || LIST_RANK[item.status] < LIST_RANK[status[key]]) status[key] = item.status;
+                });
+
+                done(cards.map(function (card) {
+                    var method = Core.cardMethod(card);
+                    var found = status[method + ':' + Number(card.id)];
+                    var foreign = card.source && card.source !== 'tmdb' && card.source !== 'cub';
+
+                    if (found === 'watching') return null;
+
+                    return {
+                        method: method,
+                        tmdb: Number(card.id),
+                        card: card,
+                        label: foreign ? 'не из TMDB' : (found ? 'в Simkl: ' + LISTS[found] : 'нет в Simkl')
+                    };
+                }).filter(Boolean));
+            });
+        }, fail);
+    }
+
     // В «Просмотрено» нет сериала, у которого есть продолжение: досмотренный
     // первый сезон «Дорохедоро» при втором в «Смотрю» — это сериал, который
     // смотрят, а не закрытый. Сравниваем по карточке TMDB, когда части уже
@@ -3056,6 +3110,7 @@
         var parts = String(url).split(':');
 
         if (url === 'unfinished') return loadUnfinished(store, fail);
+        if (url === 'lampa_look') return loadLampaOnly(store, fail);
         if (parts[0] === 'library') return loadLibraryRow(parts[1], parts[2], store, fail);
         if (parts[0] === 'similar') return loadSimilar(parts[1], Number(parts[2]), store, fail);
         if (url === 'recs_tmdb') return loadRecommended('tmdb', store, fail);
@@ -3345,6 +3400,8 @@
                 parts.push(panelRow('library:' + group.type + ':' + status, group.title + ' · ' + LISTS[status]));
             });
         });
+
+        parts.push(panelRow('lampa_look', 'Смотрю в Lampa, но не в Simkl'));
 
         PANEL_RECS.forEach(function (row) { parts.push(panelRow(row.url, row.title)); });
 

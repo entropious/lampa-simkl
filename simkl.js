@@ -2598,9 +2598,7 @@
             list.sort(byDateDesc(status === 'plantowatch' ? 'added_to_watchlist_at' : 'last_watched_at'));
 
             var entries = list.map(function (row) { return rowEntry(row); });
-            if (status !== 'completed' || type === 'movies') return done(entries);
-
-            withoutContinued(type, entries, done, fail);
+            withoutHigher(type, status, entries, done, fail);
         }, fail);
     }
 
@@ -2658,26 +2656,32 @@
         }, fail);
     }
 
-    // В «Просмотрено» нет сериала, у которого есть продолжение: досмотренный
-    // первый сезон «Дорохедоро» при втором в «Смотрю» — это сериал, который
-    // смотрят, а не закрытый. Сравниваем по карточке TMDB, когда части уже
-    // сведены к сериалу целиком (normalize).
-    function withoutContinued(type, entries, done, fail) {
-        var active = [];
-        var waiting = ACTIVE_STATUSES[type].length;
+    // Аниме у Simkl — несколько тайтлов, а карточка TMDB одна, и части бывают в
+    // разных списках: продолжение «Человека-бензопилы» в «Смотрю», а другая
+    // часть — в «Буду смотреть». Карточка показывается в одном ряду — самом
+    // «живом» из тех, где лежат её части (LIST_RANK). Отсюда же: досмотренный
+    // первый сезон «Дорохедоро» при втором в «Смотрю» — не в «Просмотрено»,
+    // это сериал, который смотрят. Сравниваем по карточке TMDB, когда части
+    // уже сведены к сериалу целиком (normalize).
+    function withoutHigher(type, status, entries, done, fail) {
+        var higher = Object.keys(LIST_RANK).filter(function (other) {
+            return LIST_RANK[other] < LIST_RANK[status];
+        });
 
-        ACTIVE_STATUSES[type].forEach(function (status) {
-            loadEntries('library:' + type + ':' + status, function (list) {
-                active = active.concat(list);
+        if (!higher.length) return done(entries);
+
+        var busy = {};
+        var waiting = higher.length;
+
+        higher.forEach(function (other) {
+            loadEntries('library:' + type + ':' + other, function (list) {
+                list.forEach(function (item) { busy[item.method + ':' + item.tmdb] = true; });
                 next();
             }, next);
         });
 
         function next() {
             if (--waiting) return;
-
-            var busy = {};
-            active.forEach(function (item) { busy[item.method + ':' + item.tmdb] = true; });
 
             normalize(entries.filter(Boolean), function (resolved) {
                 done(resolved.filter(function (item) {

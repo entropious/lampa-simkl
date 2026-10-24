@@ -294,17 +294,22 @@
     // он берёт данные через Lampa.Api.list, а тот диспатчится по source.
     var SOURCE = 'simkl';
 
-    // Разделы панели — по образцу Trakt. Персональных рекомендаций у Simkl в
-    // API нет, поэтому они собираются из рекомендаций к каждому просмотренному
-    // сериалу — у TMDB и у самого Simkl, каждая в своём разделе.
-    // «Понравившимся спискам» Trakt у Simkl соответствуют отслеживаемые.
-    var SECTIONS = [
-        { id: 'unfinished', title: 'Продолжить просмотр' },
-        { id: 'plan', title: 'Буду смотреть' },
-        { id: 'recs_tmdb', title: 'Рекомендации TMDB' },
-        { id: 'recs_simkl', title: 'Рекомендации Simkl' },
-        { id: 'lists', title: 'Мои списки', lists: true },
-        { id: 'followed', title: 'Отслеживаемые списки', lists: true }
+    // Панель — экран рядов, как родное «Избранное»: сверху «Продолжить
+    // просмотр» и рекомендации, ниже — списки Simkl отдельно по фильмам,
+    // сериалам и аниме. Персональных
+    // рекомендаций у Simkl в API нет, поэтому они собираются из рекомендаций
+    // к каждому просмотренному сериалу — у TMDB и у самого Simkl.
+    var PANEL_TOP = [
+        { url: 'unfinished', title: 'Продолжить просмотр' },
+        { url: 'recs_tmdb', title: 'Рекомендации TMDB' },
+        { url: 'recs_simkl', title: 'Рекомендации Simkl' }
+    ];
+
+    // У фильма нет «Смотрю» и «Отложено»: он смотрится целиком
+    var LIBRARY_TYPES = [
+        { type: 'movies', title: 'Фильмы', statuses: ['plantowatch', 'completed', 'dropped'] },
+        { type: 'shows', title: 'Сериалы', statuses: ['watching', 'plantowatch', 'hold', 'completed', 'dropped'] },
+        { type: 'anime', title: 'Аниме', statuses: ['watching', 'plantowatch', 'hold', 'completed', 'dropped'] }
     ];
 
     var TOKEN_KEY = 'simkl_token';
@@ -319,6 +324,7 @@
     var RECS_KEY = 'simkl_recs';
     var LAUNCHES_KEY = 'simkl_launches';
     var AUTOMARK_KEY = 'simkl_automark';
+    var EXPORT_KEY = 'simkl_export_at';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -647,6 +653,7 @@
                                 close();
                                 Lampa.Noty.show('Simkl: аккаунт подключён');
                                 if (onSuccess) onSuccess();
+                                setTimeout(function () { exportFavorites(false); }, 3000);
                                 return;
                             }
 
@@ -789,6 +796,7 @@
         // Отметка сдвигает «Продолжить просмотр», смена статуса — «Буду смотреть»,
         // так что собранные разделы после любой записи уже неверны
         entries_cache = {};
+        library_cache = null;
     }
 
     // «из 8 серий», но «из 21 серии» — после числительного идёт родительный,
@@ -1402,6 +1410,7 @@
             // повторный просмотр засчитывать нельзя. Нечего отмечать — нет и
             // пункта.
             if (unwatched.length) items.push({ title: 'Весь сериал просмотрен', whole: true });
+            items.push({ title: 'Похожее', subtitle: 'рекомендации TMDB и Simkl', similar: true });
             items.push({ title: 'Открыть на Simkl', open: true });
 
             Lampa.Select.show({
@@ -1414,6 +1423,7 @@
                     Lampa.Controller.toggle(back);
 
                     if (chosen.open) return openOnSimkl(ctx);
+                    if (chosen.similar) return openSimilar(ctx);
 
                     if (chosen.whole) markUpTo(ctx, unwatched, unwatched.length - 1);
                 },
@@ -1439,6 +1449,7 @@
             if (watched) items.push({ title: 'Убрать отметку о просмотре', unmark: true });
             else items.push({ title: 'Фильм просмотрен', mark: true });
 
+            items.push({ title: 'Похожее', subtitle: 'рекомендации TMDB и Simkl', similar: true });
             items.push({ title: 'Открыть на Simkl', open: true });
 
             Lampa.Select.show({
@@ -1448,6 +1459,7 @@
                     Lampa.Controller.toggle(back);
 
                     if (chosen.open) return openOnSimkl(ctx);
+                    if (chosen.similar) return openSimilar(ctx);
                     if (chosen.mark) return sendHistory(ctx, null, 'фильм отмечен просмотренным');
                     if (chosen.unmark) unmarkMovie(ctx);
                 },
@@ -1771,6 +1783,23 @@
 
         var method = Core.cardMethod(card);
 
+        // Просмотренный фильм «на потом» в Simkl не переносим: продолжения у
+        // него не будет, а Simkl при переносе в «Буду смотреть» стирает у
+        // фильма сам просмотр — last_watched_at становится null, и вернуть его
+        // уже не по чему. Так «Закладки» и «Позже» и портили просмотренное.
+        if (method === 'movie' && list === 'plantowatch') {
+            dropCache(cacheKey(method, card.id));
+
+            return fetchStatus(method, card.id, function (status) {
+                if (movieWatched(status)) return;
+                addToList(card, method, list);
+            });
+        }
+
+        addToList(card, method, list);
+    }
+
+    function addToList(card, method, list) {
         api({
             path: '/sync/add-to-list',
             method: 'POST',
@@ -1809,6 +1838,191 @@
                 }
             });
         });
+    }
+
+    // --- Выгрузка «Избранного» -----------------------------------------------
+
+    // Категории «Избранного» уходят в Simkl по мере того, как их ставят, но
+    // то, что лежало там до подключения аккаунта или ставилось на другом
+    // устройстве, так и оставалось бы в Lampa. Поэтому раз в сутки и по
+    // кнопке в настройках выгружаем всё, чего в Simkl ещё нет ни в одном
+    // списке. Что уже есть — не трогаем: статус могли поменять на simkl.com.
+    var EXPORT_EVERY = 24 * 60 * 60 * 1000;
+    var EXPORT_BATCH = 100;
+
+    // Карточка бывает в нескольких категориях сразу — берём самую сильную:
+    // «Просмотрено» важнее «Брошено», то важнее «Смотрю», а «Позже» и
+    // «Закладки» — самое слабое
+    var EXPORT_ORDER = ['viewed', 'thrown', 'look', 'wath', 'book'];
+
+    function favoriteCards() {
+        var all = {};
+        var wanted = {};
+        var order = [];
+
+        try {
+            all = Lampa.Favorite.all() || {};
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать «Избранное»', e);
+        }
+
+        EXPORT_ORDER.forEach(function (category) {
+            (all[category] || []).forEach(function (card) {
+                if (!card || !Number(card.id)) return;
+                // Карточки других каталогов tmdb-id не несут
+                if (card.source && card.source !== 'tmdb' && card.source !== 'cub') return;
+
+                var method = Core.cardMethod(card);
+                var key = method + ':' + Number(card.id);
+                if (wanted[key]) return;
+
+                wanted[key] = { card: card, method: method, to: FAVORITE_MAP[category] };
+                order.push(key);
+            });
+        });
+
+        return order.map(function (key) { return { key: key, item: wanted[key] }; });
+    }
+
+    function exportFavorites(manual) {
+        if (!ready()) {
+            if (manual) Lampa.Noty.show('Simkl: аккаунт не подключён');
+            return;
+        }
+
+        var cards = favoriteCards();
+
+        if (!cards.length) {
+            if (manual) Lampa.Noty.show('Simkl: в «Избранном» нечего выгружать');
+            return;
+        }
+
+        // Свежая библиотека: выгрузка решает, чего в Simkl нет
+        library_cache = null;
+
+        loadLibrary(function (rows) {
+            var have = libraryKeys(rows);
+            var planned = libraryKeys(rows, ['plantowatch']);
+
+            var missing = cards.filter(function (entry) { return !have[entry.key]; }).map(function (entry) {
+                return entry.item;
+            });
+
+            // Фильм в «Просмотрено» у Lampa, а в Simkl — в «Буду смотреть»:
+            // это прежние «Закладки» и «Позже» стёрли у него просмотр. Отмечаем
+            // просмотренным заново — в Simkl он сейчас не просмотрен, так что
+            // пересмотром это не станет.
+            var repair = cards.filter(function (entry) {
+                return entry.item.method === 'movie' && entry.item.to === 'completed' && planned[entry.key];
+            }).map(function (entry) {
+                return entry.item;
+            });
+
+            Lampa.Storage.set(EXPORT_KEY, Date.now());
+
+            if (!missing.length && !repair.length) {
+                if (manual) Lampa.Noty.show('Simkl: всё из «Избранного» уже там');
+                return;
+            }
+
+            sendExport(missing, function (added, lost) {
+                repairWatched(repair, function (repaired) {
+                    entries_cache = {};
+                    library_cache = null;
+                    clearCache();
+
+                    var text = [];
+                    if (added || manual) text.push('из «Избранного» выгружено ' + added);
+                    if (lost) text.push('не найдено в Simkl ' + lost);
+                    if (repaired) text.push('снова отмечено просмотренными ' + repaired);
+
+                    if (text.length) Lampa.Noty.show('Simkl: ' + text.join(', '));
+                });
+            });
+        }, function () {
+            if (manual) Lampa.Noty.show('Simkl: не удалось получить списки Simkl');
+        });
+    }
+
+    // add-to-list — только статус, события просмотра он не пишет, так что
+    // пересмотров выгрузка не создаёт. Пачками по сотне, одна за другой.
+    function sendExport(items, done) {
+        var added = 0;
+        var lost = 0;
+
+        function next(index) {
+            var batch = items.slice(index, index + EXPORT_BATCH);
+            if (!batch.length) return done(added, lost);
+
+            var body = {};
+
+            batch.forEach(function (item) {
+                var media = mediaBody(item.card, item.method, { to: item.to });
+                var kind = item.method === 'tv' ? 'shows' : 'movies';
+
+                (body[kind] = body[kind] || []).push(media[kind][0]);
+            });
+
+            api({
+                path: '/sync/add-to-list',
+                method: 'POST',
+                auth: true,
+                body: body,
+                onDone: function (data) {
+                    var ok = (data && data.added) || {};
+                    var missing = (data && data.not_found) || {};
+
+                    added += (ok.movies || []).length + (ok.shows || []).length;
+                    lost += (missing.movies || []).length + (missing.shows || []).length;
+                    next(index + EXPORT_BATCH);
+                },
+                onFail: function () {
+                    done(added, lost + items.length - index);
+                }
+            });
+        }
+
+        next(0);
+    }
+
+    function repairWatched(items, done) {
+        if (!items.length) return done(0);
+
+        var repaired = 0;
+
+        function next(index) {
+            var batch = items.slice(index, index + EXPORT_BATCH);
+            if (!batch.length) return done(repaired);
+
+            api({
+                path: '/sync/history',
+                method: 'POST',
+                auth: true,
+                body: {
+                    movies: batch.map(function (item) { return mediaBody(item.card, 'movie', null).movies[0]; })
+                },
+                onDone: function (data) {
+                    // added.movies тут ноль: Simkl не считает это новым
+                    // просмотром. Итог виден в statuses — какой статус стал.
+                    ((data && data.added && data.added.statuses) || []).forEach(function (entry) {
+                        if (entry.response && entry.response.status === 'completed') repaired++;
+                    });
+                    next(index + EXPORT_BATCH);
+                },
+                onFail: function () { done(repaired); }
+            });
+        }
+
+        next(0);
+    }
+
+    function scheduleExport() {
+        var last = Number(Lampa.Storage.get(EXPORT_KEY, 0)) || 0;
+
+        if (ready() && Date.now() - last > EXPORT_EVERY) {
+            // Не в момент старта: Lampa в это время и так грузит главную
+            setTimeout(function () { exportFavorites(false); }, 15000);
+        }
     }
 
     function followFavorite() {
@@ -1978,8 +2192,6 @@
     var ENTRIES_TTL = 5 * 60 * 1000;
     var entries_cache = {};
 
-    var user_id = null;
-
     // TMDB отдаёт дату выхода без времени, «2026-07-26». Через new Date её не
     // пропускаем: полночь по UTC западнее Гринвича превращается в предыдущий день.
     function airDate(value) {
@@ -1987,16 +2199,6 @@
         if (parts.length !== 3) return '';
 
         return parts[2] + '.' + parts[1] + '.' + parts[0].slice(2);
-    }
-
-    function itemsWord(count) {
-        var n = count % 100;
-        var n1 = n % 10;
-
-        if (n > 10 && n < 20) return 'тайтлов';
-        if (n1 === 1) return 'тайтл';
-        if (n1 > 1 && n1 < 5) return 'тайтла';
-        return 'тайтлов';
     }
 
     // Запись раздела: что открыть и что подписать под постером. Без tmdb-id
@@ -2228,18 +2430,48 @@
         }, fail);
     }
 
-    // Аналог Watchlist у Trakt: фильмы, сериалы и аниме, сведённые по дате
-    // добавления, свежее сверху.
-    function loadPlan(done, fail) {
-        var paths = [
-            'shows/plantowatch?extended=full',
-            'movies/plantowatch?extended=full',
-            'anime/plantowatch?extended=full'
-        ];
+    // Вся библиотека — три запроса, по одному на фильмы, сериалы и аниме, со
+    // всеми статусами сразу. Из неё собираются ряды панели, исключения в
+    // рекомендациях и выгрузка «Избранного». Держим столько же, сколько
+    // собранные разделы, и сбрасываем вместе с ними.
+    var library_cache = null;
 
-        fetchBuckets(paths, function (rows) {
-            rows.sort(byDateDesc('added_to_watchlist_at'));
-            done(rows.map(function (row) { return rowEntry(row); }));
+    function loadLibrary(done, fail) {
+        if (library_cache && Date.now() - library_cache.at < ENTRIES_TTL) return done(library_cache.rows);
+
+        fetchBuckets(['movies', 'shows', 'anime'], function (rows) {
+            library_cache = { at: Date.now(), rows: rows };
+            done(rows);
+        }, fail);
+    }
+
+    // Что уже есть в любом списке, по tmdb-id и simkl-id
+    function libraryKeys(rows, statuses) {
+        var keys = {};
+
+        rows.forEach(function (row) {
+            if (statuses && statuses.indexOf(row.item.status) === -1) return;
+
+            var ids = rowMedia(row).ids || {};
+
+            if (ids.simkl) keys['simkl:' + ids.simkl] = true;
+            if (Number(ids.tmdb)) keys[rowMethod(row) + ':' + Number(ids.tmdb)] = true;
+        });
+
+        return keys;
+    }
+
+    // Один список Simkl одного типа: «Сериалы · Смотрю», «Фильмы · Брошено».
+    // Отложенное и брошенное — по последнему просмотру, «Буду смотреть» — по
+    // дате добавления, свежее сверху.
+    function loadLibraryRow(type, status, done, fail) {
+        loadLibrary(function (rows) {
+            var list = rows.filter(function (row) {
+                return row.type === type && row.item.status === status;
+            });
+
+            list.sort(byDateDesc(status === 'plantowatch' ? 'added_to_watchlist_at' : 'last_watched_at'));
+            done(list.map(function (row) { return rowEntry(row); }));
         }, fail);
     }
 
@@ -2312,17 +2544,16 @@
     }
 
     function recSources(done, fail) {
-        fetchBuckets(['shows', 'anime'], function (rows) {
-            var library = {};
+        loadLibrary(function (rows) {
+            var library = libraryKeys(rows);
             var sources = [];
 
             rows.forEach(function (row) {
+                if (row.type === 'movies') return;
+
                 var ids = rowMedia(row).ids || {};
                 var method = rowMethod(row);
                 var status = row.item.status;
-
-                if (ids.simkl) library['simkl:' + ids.simkl] = true;
-                if (Number(ids.tmdb)) library[method + ':' + Number(ids.tmdb)] = true;
 
                 var started = status === 'watching' && row.item.last_watched_at;
                 if (method !== 'tv' || !(status === 'completed' || started)) return;
@@ -2387,23 +2618,124 @@
         api({
             path: '/' + (source.anime ? 'anime' : 'tv') + '/' + encodeURIComponent(source.simkl),
             onDone: function (data) {
-                var list = ((data && data.users_recommendations) || []).map(function (item) {
-                    var movie = item.type === 'movie' || item.anime_type === 'movie';
-
-                    return {
-                        method: movie ? 'movie' : 'tv',
-                        tmdb: Number(item.ids && item.ids.tmdb) || 0,
-                        simkl: item.ids && item.ids.simkl
-                    };
-                }).filter(function (item) {
-                    return item.tmdb || item.simkl;
-                });
+                var list = simklRecItems(data);
 
                 recs[key] = { at: Date.now(), list: list };
                 done(list);
             },
             onFail: function () { done([]); }
         });
+    }
+
+    function simklRecItems(data) {
+        return ((data && data.users_recommendations) || []).map(function (item) {
+            var movie = item.type === 'movie' || item.anime_type === 'movie';
+
+            return {
+                method: movie ? 'movie' : 'tv',
+                tmdb: Number(item.ids && item.ids.tmdb) || 0,
+                simkl: item.ids && item.ids.simkl
+            };
+        }).filter(function (item) {
+            return item.tmdb || item.simkl;
+        });
+    }
+
+    // --- Похожее на один тайтл ----------------------------------------------
+
+    // Пункт «Похожее» в меню кнопки: рекомендации TMDB и Simkl к этому
+    // фильму или сериалу вперемешку, через одну. Под постером — откуда
+    // совет. Просмотренное и брошенное не предлагаем, «Смотрю» и «Буду
+    // смотреть» оставляем: это как раз то, что человек и сам собирался.
+    function loadSimilar(method, tmdb, done, fail) {
+        var from_tmdb = null;
+        var from_simkl = null;
+
+        function finish() {
+            if (!from_tmdb || !from_simkl) return;
+
+            resolveAnime(from_simkl, function () {
+                loadLibrary(function (rows) {
+                    var seen_before = libraryKeys(rows, ['completed', 'dropped']);
+                    var merged = {};
+                    var list = [];
+
+                    function add(item, source) {
+                        if (!item.tmdb) return;
+
+                        var key = item.method + ':' + item.tmdb;
+                        if (key === method + ':' + tmdb || seen_before[key]) return;
+                        if (item.simkl && seen_before['simkl:' + item.simkl]) return;
+
+                        if (merged[key]) {
+                            if (merged[key].from.indexOf(source) === -1) merged[key].from.push(source);
+                            if (!merged[key].card && item.card) merged[key].card = item.card;
+                            return;
+                        }
+
+                        merged[key] = { method: item.method, tmdb: item.tmdb, card: item.card, from: [source] };
+                        list.push(merged[key]);
+                    }
+
+                    for (var i = 0; i < Math.max(from_tmdb.length, from_simkl.length); i++) {
+                        if (from_tmdb[i]) add(from_tmdb[i], 'TMDB');
+                        if (from_simkl[i]) add(from_simkl[i], 'Simkl');
+                    }
+
+                    done(list.map(function (item) {
+                        return { method: item.method, tmdb: item.tmdb, card: item.card, label: item.from.join(' · ') };
+                    }));
+                }, fail);
+            });
+        }
+
+        tmdbGet(method + '/' + tmdb + '/recommendations', function (data) {
+            from_tmdb = ((data && data.results) || []).filter(function (item) {
+                return item && item.id;
+            }).map(function (item) {
+                return { method: method, tmdb: item.id, card: trim(item, method) };
+            });
+
+            finish();
+        });
+
+        // Simkl-id по tmdb-id: у сериала он бывает и аниме — тогда детали в
+        // /anime, а не в /tv
+        api({
+            path: '/search/id?tmdb=' + encodeURIComponent(tmdb) + '&type=' + (method === 'tv' ? 'show' : 'movie'),
+            auth: true,
+            onDone: function (data) {
+                var hit = Array.isArray(data) ? data[0] : null;
+                var simkl = hit && hit.ids && hit.ids.simkl;
+
+                if (!simkl) {
+                    from_simkl = [];
+                    return finish();
+                }
+
+                var kind = hit.type === 'anime' ? 'anime' : (hit.type === 'movie' ? 'movies' : 'tv');
+
+                api({
+                    path: '/' + kind + '/' + encodeURIComponent(simkl),
+                    onDone: function (details) {
+                        from_simkl = simklRecItems(details);
+                        finish();
+                    },
+                    onFail: function () {
+                        from_simkl = [];
+                        finish();
+                    }
+                });
+            },
+            onFail: function () {
+                from_simkl = [];
+                finish();
+            }
+        });
+    }
+
+    function openSimilar(ctx) {
+        openSection('similar:' + ctx.method + ':' + ctx.card.id, 'Похожее на «' + Core.cardTitle(ctx.card) + '»');
     }
 
     // Не больше workers заданий разом, done — когда отработали все
@@ -2530,55 +2862,6 @@
         }, fail);
     }
 
-    function fetchUserId(done, fail) {
-        if (user_id) return done(user_id);
-
-        api({
-            path: '/users/settings',
-            method: 'POST',
-            auth: true,
-            onDone: function (data) {
-                user_id = data && data.account && data.account.id;
-
-                if (user_id) done(user_id);
-                else fail();
-            },
-            onFail: fail
-        });
-    }
-
-    // Бесплатный аккаунт по документации вместо списков получает 200 с полем
-    // error и одной карточкой-заглушкой «купите PRO». Статус тут ничего не
-    // говорит — смотреть надо на само поле.
-    function fetchLists(followed, done, fail) {
-        fetchUserId(function (id) {
-            api({
-                path: '/lists/user/' + id + '?limit=100' + (followed ? '&followed=true' : ''),
-                auth: true,
-                onDone: function (data) {
-                    if (data && data.error) return fail(data.error);
-                    done((data && data.lists) || []);
-                },
-                onFail: function () { fail(); }
-            });
-        }, fail);
-    }
-
-    function loadList(id, done, fail) {
-        api({
-            path: '/lists/' + encodeURIComponent(id) + '?limit=500',
-            auth: true,
-            onDone: function (data) {
-                if (data && data.error) return fail();
-
-                done(((data && data.items) || []).map(function (item) {
-                    return entry(item.type === 'movie' ? 'movie' : 'tv', item.ids, null, item.type === 'anime');
-                }));
-            },
-            onFail: fail
-        });
-    }
-
     function loadEntries(url, done, fail) {
         var hit = entries_cache[url];
         if (hit && Date.now() - hit.at < ENTRIES_TTL) return done(hit.entries);
@@ -2601,11 +2884,13 @@
             });
         }
 
+        var parts = String(url).split(':');
+
         if (url === 'unfinished') return loadUnfinished(store, fail);
-        if (url === 'plan') return loadPlan(store, fail);
+        if (parts[0] === 'library') return loadLibraryRow(parts[1], parts[2], store, fail);
+        if (parts[0] === 'similar') return loadSimilar(parts[1], Number(parts[2]), store, fail);
         if (url === 'recs_tmdb') return loadRecommended('tmdb', store, fail);
         if (url === 'recs_simkl') return loadRecommended('simkl', store, fail);
-        if (String(url).indexOf('list:') === 0) return loadList(url.slice(5), store, fail);
 
         fail();
     }
@@ -2628,15 +2913,61 @@
         var active = Lampa.Activity.active();
         if (!active || active.source !== SOURCE || !active.activity) return;
 
-        var section = labels[active.url];
+        var section = active.component === 'main' ? panelLabels() : labels[active.url];
         if (!section) return;
 
-        active.activity.render().find('.card').each(function () {
+        var root = active.activity.render();
+        watchCards(root);
+
+        root.find('.card').each(function () {
             var data = this.card_data;
             var label = data && section[data.id];
+            var age = $(this).find('.card__age');
 
-            if (label) $(this).addClass('simkl-card').find('.card__age').text(label);
+            if (label && age.text() !== label) {
+                $(this).addClass('simkl-card');
+                age.text(label);
+            }
         });
+    }
+
+    // На панели подписи всех рядов сразу. Карточка бывает в двух рядах —
+    // сериал из «Продолжить просмотр» лежит и в «Сериалы · Смотрю», — и
+    // подпись у неё одна: «где остановился» важнее года.
+    function panelLabels() {
+        var merged = {};
+        var order = PANEL_TOP.map(function (row) { return row.url; }).concat(Object.keys(labels));
+
+        order.forEach(function (url) {
+            if (String(url).indexOf('similar:') === 0) return;
+
+            var section = labels[url] || {};
+
+            Object.keys(section).forEach(function (id) {
+                if (!(id in merged)) merged[id] = section[id];
+            });
+        });
+
+        return merged;
+    }
+
+    // Ряды панели дорисовывают карточки, когда до них докручивают, и
+    // подгружают новые ряды снизу — следим за разметкой, а не ловим события
+    function watchCards(root) {
+        var node = root && root[0];
+        if (!node || node.simkl_watched || typeof MutationObserver === 'undefined') return;
+
+        var timer = null;
+
+        node.simkl_watched = true;
+        new MutationObserver(function () {
+            if (timer) return;
+
+            timer = setTimeout(function () {
+                timer = null;
+                applyLabels();
+            }, 100);
+        }).observe(node, { childList: true, subtree: true });
     }
 
     // Источник для родного category_full. Всё, что ему нужно, — метод list;
@@ -2646,6 +2977,24 @@
     // сам, когда до них докручивают.
     function buildSource() {
         return Object.assign({}, Lampa.Api.sources.tmdb, {
+            // Панель — родной экран main: ряды он берёт отсюда частями, по
+            // мере прокрутки, а «Ещё» у ряда открывает category_full с его url
+            main: function (params, oncomplite, onerror) {
+                if (!configured() || !token()) {
+                    onerror();
+                    return null;
+                }
+
+                var parts = panelParts();
+
+                function load(loaded, empty) {
+                    Lampa.Api.partNext(parts, 4, loaded, empty);
+                }
+
+                load(oncomplite, onerror);
+                return load;
+            },
+
             list: function (params, oncomplite, onerror) {
                 if (!configured() || !token()) return onerror();
 
@@ -2719,32 +3068,39 @@
         Lampa.Activity.push({ component: 'category_full', source: SOURCE, url: url, title: title, page: 1 });
     }
 
-    function openLists(section, back) {
-        var followed = section.id === 'followed';
+    // Ряд панели: первые двадцать карточек раздела. Пустой ряд Lampa не
+    // рисует сама — достаточно ответить ничем.
+    function panelRow(url, title) {
+        return function (call) {
+            loadEntries(url, function (entries) {
+                var slice = entries.slice(0, PAGE_SIZE);
+                if (!slice.length) return call();
 
-        fetchLists(followed, function (lists) {
-            if (!lists.length) {
-                Lampa.Controller.toggle(back);
-                return Lampa.Noty.show(followed
-                    ? 'Simkl: отслеживаемых списков нет'
-                    : 'Simkl: своих списков нет');
-            }
+                collect(url, slice, function (results) {
+                    call({
+                        title: title,
+                        results: results,
+                        url: url,
+                        source: SOURCE,
+                        page: 1,
+                        total_pages: Math.ceil(entries.length / PAGE_SIZE)
+                    });
+                    scheduleLabels();
+                }, function () { call(); });
+            }, function () { call(); });
+        };
+    }
 
-            Lampa.Select.show({
-                title: section.title,
-                items: lists.map(function (list) {
-                    var count = (list.counts && list.counts.items) || 0;
-                    return { title: list.name, subtitle: count + ' ' + itemsWord(count), id: list.id };
-                }),
-                onSelect: function (chosen) { openSection('list:' + chosen.id, chosen.title); },
-                onBack: function () { Lampa.Controller.toggle(back); }
+    function panelParts() {
+        var parts = PANEL_TOP.map(function (row) { return panelRow(row.url, row.title); });
+
+        LIBRARY_TYPES.forEach(function (group) {
+            group.statuses.forEach(function (status) {
+                parts.push(panelRow('library:' + group.type + ':' + status, group.title + ' · ' + LISTS[status]));
             });
-        }, function (reason) {
-            Lampa.Controller.toggle(back);
-            Lampa.Noty.show(reason === 'premium_only'
-                ? 'Simkl: списки доступны только с PRO или VIP'
-                : 'Simkl: не удалось получить списки');
         });
+
+        return parts;
     }
 
     function openPanel() {
@@ -2754,19 +3110,7 @@
         // фокус, пока человек ещё дожимает подтверждение на телефоне.
         if (!token()) return startPinAuth();
 
-        var back = Lampa.Controller.enabled().name;
-
-        Lampa.Select.show({
-            title: 'Simkl',
-            items: SECTIONS.map(function (section) {
-                return { title: section.title, section: section };
-            }),
-            onSelect: function (chosen) {
-                if (chosen.section.lists) return openLists(chosen.section, back);
-                openSection(chosen.section.id, chosen.section.title);
-            },
-            onBack: function () { Lampa.Controller.toggle(back); }
-        });
+        Lampa.Activity.push({ component: 'main', source: SOURCE, url: '', title: 'Simkl', page: 1 });
     }
 
     function addMenuItem() {
@@ -2849,6 +3193,16 @@
 
         Lampa.SettingsApi.addParam({
             component: 'simkl',
+            param: { name: 'simkl_export', type: 'button' },
+            field: {
+                name: 'Выгрузить «Избранное» в Simkl',
+                description: 'То, чего в Simkl ещё нет ни в одном списке. Само — раз в сутки'
+            },
+            onChange: function () { exportFavorites(true); }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'simkl',
             param: { name: AUTOMARK_KEY, type: 'trigger', default: true },
             field: {
                 name: 'Отмечать просмотренное',
@@ -2866,6 +3220,7 @@
         loadRecs();
         addSettings();
         startAutomark();
+        scheduleExport();
 
         if (!configured()) {
             console.warn('Simkl: не задан CLIENT_ID, плагин ничего не покажет');

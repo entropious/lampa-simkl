@@ -334,6 +334,7 @@
     var LAUNCHES_KEY = 'simkl_launches';
     var AUTOMARK_KEY = 'simkl_automark';
     var EXPORT_KEY = 'simkl_export_at';
+    var SEQUELS_KEY = 'simkl_sequels_planned';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -662,7 +663,9 @@
                                 close();
                                 Lampa.Noty.show('Simkl: аккаунт подключён');
                                 if (onSuccess) onSuccess();
-                                setTimeout(function () { exportFavorites(false); }, 3000);
+                                setTimeout(function () {
+                                    exportFavorites(false, function () { syncSequels(false); });
+                                }, 3000);
                                 return;
                             }
 
@@ -964,6 +967,23 @@
         if (ids.tvdb && own.tvdb) return String(ids.tvdb) === String(own.tvdb);
 
         return !ids.tmdb || Number(ids.tmdb) === Number(tmdb);
+    }
+
+    // Часть аниме, чей состав уже известен, — это сериал TMDB целиком. Свой
+    // tmdb-id у части бывает, но не тот: у финального сезона «Атаки титанов»
+    // он 313599, и карточки по нему TMDB не отдаёт — запись в ряду считалась
+    // бы, а не рисовалась.
+    function partsBase(simkl) {
+        var id = Number(simkl);
+        var found = 0;
+
+        Object.keys(parts_map).some(function (tmdb) {
+            var parts = parts_map[tmdb] && parts_map[tmdb].parts;
+            if (parts && parts.indexOf(id) !== -1) found = Number(tmdb);
+            return !!found;
+        });
+
+        return found;
     }
 
     function animeParts(tmdb, base, done) {
@@ -1893,17 +1913,19 @@
         return order.map(function (key) { return { key: key, item: wanted[key] }; });
     }
 
-    function exportFavorites(manual) {
+    function exportFavorites(manual, after) {
+        var finish = after || function () {};
+
         if (!ready()) {
             if (manual) Lampa.Noty.show('Simkl: аккаунт не подключён');
-            return;
+            return finish();
         }
 
         var cards = favoriteCards();
 
         if (!cards.length) {
             if (manual) Lampa.Noty.show('Simkl: в «Избранном» нечего выгружать');
-            return;
+            return finish();
         }
 
         // Свежая библиотека: выгрузка решает, чего в Simkl нет
@@ -1931,7 +1953,7 @@
 
             if (!missing.length && !repair.length) {
                 if (manual) Lampa.Noty.show('Simkl: всё из «Избранного» уже там');
-                return;
+                return finish();
             }
 
             sendExport(missing, function (added, lost) {
@@ -1946,10 +1968,12 @@
                     if (repaired) text.push('снова отмечено просмотренными ' + repaired);
 
                     if (text.length) Lampa.Noty.show('Simkl: ' + text.join(', '));
+                    finish();
                 });
             });
         }, function () {
             if (manual) Lampa.Noty.show('Simkl: не удалось получить списки Simkl');
+            finish();
         });
     }
 
@@ -2025,6 +2049,140 @@
         next(0);
     }
 
+    // --- Продолжения аниме ----------------------------------------------------
+
+    // У обычного сериала новый сезон — часть того же тайтла, и Simkl сам
+    // возвращает его в «Смотрю». У аниме продолжение — отдельный тайтл
+    // («Dorohedoro Season 2», «Ninja Kamui: Red Vendetta»), и в списки оно
+    // само не попадает: досмотрел первую часть — а второй нигде нет. Поэтому
+    // для каждого аниме из «Просмотрено» и «Смотрю» ищем продолжения тем же
+    // animeParts, что собирает части на карточке, и те, которых нет ни в
+    // одном списке, кладём в «Смотрю». Что лежит в любом списке, включая
+    // брошенное, не трогаем — значит, решали руками.
+    //
+    // Ещё не вышедшее — в «Буду смотреть»: Simkl, вопреки документации, сам
+    // его туда не перекладывает. Такие продолжения запоминаем и, когда у них
+    // выходят серии, переносим в «Смотрю» — если они всё ещё в «Буду
+    // смотреть», то есть руками их не трогали.
+    var SEQUEL_WORKERS = 3;
+
+    function plannedSequels() {
+        try {
+            return Lampa.Storage.get(SEQUELS_KEY, '[]') || [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // Вышло ли хоть что-то: у анонса нет ни даты первой серии, ни числа серий.
+    // Детали публичные и лежат в кэше Cloudflare.
+    function sequelAired(id, done) {
+        api({
+            path: '/anime/' + encodeURIComponent(id),
+            onDone: function (data) {
+                done(!!(data && data.first_aired && Number(data.total_episodes) > 0));
+            },
+            onFail: function () { done(null); }
+        });
+    }
+
+    function syncSequels(manual, done) {
+        var finish = done || function () {};
+        if (!ready()) return finish(0);
+
+        loadLibrary(function (rows) {
+            var have = libraryKeys(rows);
+            var planned_now = libraryKeys(rows, ['plantowatch']);
+            var planned = plannedSequels();
+            var candidates = [];
+
+            var bases = rows.filter(function (row) {
+                var ids = rowMedia(row).ids || {};
+
+                return row.type === 'anime' && rowMethod(row) === 'tv' && Number(ids.tmdb) && ids.simkl &&
+                    (row.item.status === 'completed' || row.item.status === 'watching');
+            });
+
+            // Отложенные нами продолжения, которые всё ещё ждут в «Буду смотреть»
+            planned.forEach(function (id) {
+                if (planned_now['simkl:' + id]) candidates.push({ id: id, planned: true });
+            });
+
+            pool(bases, SEQUEL_WORKERS, function (row, next) {
+                var ids = rowMedia(row).ids;
+
+                animeParts(Number(ids.tmdb), ids.simkl, function (parts) {
+                    (parts || []).forEach(function (id) {
+                        var known = candidates.some(function (item) { return item.id === id; });
+                        if (!have['simkl:' + id] && !known) candidates.push({ id: id, planned: false });
+                    });
+                    next();
+                });
+            }, function () {
+                pool(candidates, SEQUEL_WORKERS, function (item, next) {
+                    sequelAired(item.id, function (aired) {
+                        item.aired = aired;
+                        next();
+                    });
+                }, function () {
+                    var send = candidates.filter(function (item) {
+                        // Не узнали — не трогаем; отложенное ждёт выхода серий
+                        if (item.aired === null) return false;
+                        return item.planned ? item.aired : true;
+                    });
+
+                    var keep = planned.filter(function (id) {
+                        return planned_now['simkl:' + id] && !send.some(function (item) { return item.id === id && item.aired; });
+                    });
+
+                    send.forEach(function (item) {
+                        if (!item.aired && keep.indexOf(item.id) === -1) keep.push(item.id);
+                    });
+
+                    Lampa.Storage.set(SEQUELS_KEY, keep);
+
+                    if (!send.length) {
+                        if (manual) Lampa.Noty.show('Simkl: новых продолжений аниме нет');
+                        return finish(0);
+                    }
+
+                    api({
+                        path: '/sync/add-to-list',
+                        method: 'POST',
+                        auth: true,
+                        body: {
+                            shows: send.map(function (item) {
+                                return { ids: { simkl: item.id }, to: item.aired ? 'watching' : 'plantowatch' };
+                            })
+                        },
+                        onDone: function () {
+                            var watching = send.filter(function (item) { return item.aired; }).length;
+                            var later = send.length - watching;
+
+                            entries_cache = {};
+                            library_cache = null;
+                            clearCache();
+
+                            var text = [];
+                            if (watching) text.push('в «Смотрю» — ' + watching);
+                            if (later) text.push('в «Буду смотреть» — ' + later);
+
+                            Lampa.Noty.show('Simkl: продолжения аниме ' + text.join(', '));
+                            finish(send.length);
+                        },
+                        onFail: function () {
+                            if (manual) Lampa.Noty.show('Simkl: не удалось добавить продолжения аниме');
+                            finish(0);
+                        }
+                    });
+                });
+            });
+        }, function () {
+            if (manual) Lampa.Noty.show('Simkl: не удалось получить списки Simkl');
+            finish(0);
+        });
+    }
+
     function scheduleExport() {
         var last = Number(Lampa.Storage.get(EXPORT_KEY, 0)) || 0;
 
@@ -2032,6 +2190,10 @@
             // Не в момент старта: Lampa в это время и так грузит главную
             setTimeout(function () { exportFavorites(false); }, 15000);
         }
+
+        // Продолжения — при каждом старте: состав частей каждого аниме лежит
+        // в кэше неделю, так что обычно это три запроса за библиотекой
+        if (ready()) setTimeout(function () { syncSequels(false); }, 20000);
     }
 
     function followFavorite() {
@@ -2217,7 +2379,9 @@
         var tmdb = Number(ids && ids.tmdb);
         var simkl = ids && (ids.simkl || ids.simkl_id);
 
-        if (tmdb) return { method: method, tmdb: tmdb, label: label };
+        // У аниме simkl-id нужен и при tmdb-id — по нему часть сводится к
+        // сериалу целиком (см. partsBase)
+        if (tmdb) return { method: method, tmdb: tmdb, simkl: anime ? simkl : undefined, label: label };
         if (anime && simkl) return { method: method, tmdb: 0, simkl: simkl, label: label };
 
         return null;
@@ -2876,7 +3040,14 @@
         if (hit && Date.now() - hit.at < ENTRIES_TTL) return done(hit.entries);
 
         function store(list) {
-            resolveAnime(list.filter(Boolean), function (resolved) {
+            list = list.filter(Boolean);
+
+            list.forEach(function (item) {
+                var base = item.method === 'tv' && item.simkl && partsBase(item.simkl);
+                if (base) item.tmdb = base;
+            });
+
+            resolveAnime(list, function (resolved) {
                 // Два сезона одного аниме сводятся к одной карточке TMDB —
                 // показываем её один раз, по первой, то есть свежей, записи
                 var seen = {};
@@ -3285,10 +3456,13 @@
             component: 'simkl',
             param: { name: 'simkl_export', type: 'button' },
             field: {
-                name: 'Выгрузить «Избранное» в Simkl',
-                description: 'То, чего в Simkl ещё нет ни в одном списке. Само — раз в сутки'
+                name: 'Синхронизировать с Simkl',
+                description: 'Выгрузить «Избранное», чего в Simkl ещё нет, и добавить в «Смотрю» ' +
+                    'продолжения досмотренных аниме. Само — раз в сутки'
             },
-            onChange: function () { exportFavorites(true); }
+            onChange: function () {
+                exportFavorites(true, function () { syncSequels(true); });
+            }
         });
 
         Lampa.SettingsApi.addParam({

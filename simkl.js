@@ -2602,21 +2602,49 @@
         }, fail);
     }
 
-    // «Смотрю» в «Избранном» Lampa, которого нет в «Смотрю» у Simkl. Счётчики
-    // расходятся по трём причинам, и подпись говорит, какая это: в Simkl
-    // тайтл лежит в другом списке (выгрузка его не трогает — статус могли
-    // поменять на simkl.com; фильм Simkl из «Смотрю» сам переводит в
-    // «Просмотрено»), его нет в Simkl вовсе или карточка не из TMDB.
+    // Расхождения «Избранного» с Simkl: карточка в категории, которая уходит
+    // в Simkl, а там лежит в другом списке или её нет вовсе. Подпись — откуда
+    // и куда: «Позже → в Simkl: Просмотрено». Причины бывают такие: статус
+    // поменяли на simkl.com, а выгрузка «Избранного» уже лежащее не трогает;
+    // просмотренный фильм «Позже» и «Закладки» в «Буду смотреть» не переносят;
+    // тайтла нет в Simkl (уйдёт со следующей выгрузкой) или карточка не из
+    // TMDB. Сверка односторонняя: что есть в Simkl, но нет в «Избранном», —
+    // не расхождение, синхронизация идёт из Lampa.
     var LIST_RANK = { watching: 0, hold: 1, plantowatch: 2, completed: 3, dropped: 4 };
 
-    function loadLampaOnly(done, fail) {
-        var cards = [];
+    var FAVORITE_TITLES = {
+        viewed: 'Просмотрено',
+        thrown: 'Брошено',
+        look: 'Смотрю',
+        wath: 'Позже',
+        book: 'Закладки'
+    };
+
+    function loadMismatches(done, fail) {
+        var all = {};
 
         try {
-            cards = (Lampa.Favorite.all().look || []).filter(function (card) { return card && Number(card.id); });
+            all = Lampa.Favorite.all() || {};
         } catch (e) {
             console.error('Simkl: не удалось прочитать «Избранное»', e);
         }
+
+        // Карточка бывает в нескольких категориях — сверяем самую сильную,
+        // как и выгрузка
+        var seen = {};
+        var cards = [];
+
+        EXPORT_ORDER.forEach(function (category) {
+            (all[category] || []).forEach(function (card) {
+                if (!card || !Number(card.id)) return;
+
+                var key = Core.cardMethod(card) + ':' + Number(card.id);
+                if (seen[key]) return;
+
+                seen[key] = true;
+                cards.push({ card: card, category: category });
+            });
+        });
 
         if (!cards.length) return done([]);
 
@@ -2638,18 +2666,24 @@
                     if (!(key in status) || LIST_RANK[item.status] < LIST_RANK[status[key]]) status[key] = item.status;
                 });
 
-                done(cards.map(function (card) {
+                done(cards.map(function (entry) {
+                    var card = entry.card;
                     var method = Core.cardMethod(card);
+                    var want = FAVORITE_MAP[entry.category];
                     var found = status[method + ':' + Number(card.id)];
                     var foreign = card.source && card.source !== 'tmdb' && card.source !== 'cub';
 
-                    if (found === 'watching') return null;
+                    if (found === want) return null;
+                    // Фильм в «Смотрю» Simkl сам переводит в «Просмотрено»
+                    if (method === 'movie' && want === 'watching' && found === 'completed') return null;
+
+                    var where = foreign ? 'не из TMDB' : (found ? 'в Simkl: ' + LISTS[found] : 'нет в Simkl');
 
                     return {
                         method: method,
                         tmdb: Number(card.id),
                         card: card,
-                        label: foreign ? 'не из TMDB' : (found ? 'в Simkl: ' + LISTS[found] : 'нет в Simkl')
+                        label: FAVORITE_TITLES[entry.category] + ' → ' + where
                     };
                 }).filter(Boolean));
             });
@@ -3114,7 +3148,7 @@
         var parts = String(url).split(':');
 
         if (url === 'unfinished') return loadUnfinished(store, fail);
-        if (url === 'lampa_look') return loadLampaOnly(store, fail);
+        if (url === 'mismatch') return loadMismatches(store, fail);
         if (parts[0] === 'library') return loadLibraryRow(parts[1], parts[2], store, fail);
         if (parts[0] === 'similar') return loadSimilar(parts[1], Number(parts[2]), store, fail);
         if (url === 'recs_tmdb') return loadRecommended('tmdb', store, fail);
@@ -3405,7 +3439,7 @@
             });
         });
 
-        parts.push(panelRow('lampa_look', 'Смотрю в Lampa, но не в Simkl'));
+        parts.push(panelRow('mismatch', 'Не совпадает с Simkl'));
 
         PANEL_RECS.forEach(function (row) { parts.push(panelRow(row.url, row.title)); });
 

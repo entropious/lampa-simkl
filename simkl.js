@@ -294,22 +294,31 @@
     // он берёт данные через Lampa.Api.list, а тот диспатчится по source.
     var SOURCE = 'simkl';
 
-    // Панель — экран рядов, как родное «Избранное»: сверху «Продолжить
-    // просмотр» и рекомендации, ниже — списки Simkl отдельно по фильмам,
-    // сериалам и аниме. Персональных
-    // рекомендаций у Simkl в API нет, поэтому они собираются из рекомендаций
-    // к каждому просмотренному сериалу — у TMDB и у самого Simkl.
-    var PANEL_TOP = [
-        { url: 'unfinished', title: 'Продолжить просмотр' },
-        { url: 'recs_tmdb', title: 'Рекомендации TMDB' },
-        { url: 'recs_simkl', title: 'Рекомендации Simkl' }
+    // Панель — экран рядов, как родное «Избранное». Сверху «Продолжить
+    // просмотр», за ним то, что ещё смотрят или собираются, — каруселями,
+    // отдельно по фильмам, сериалам и аниме. Просмотренное и брошенное —
+    // плитками в одной карусели, каждая открывает свой грид. Рекомендации —
+    // в самом низу. Персональных рекомендаций у Simkl в API нет, поэтому они
+    // собираются из рекомендаций к каждому просмотренному сериалу — у TMDB и
+    // у самого Simkl.
+    var LIBRARY_TYPES = [
+        { type: 'movies', title: 'Фильмы' },
+        { type: 'shows', title: 'Сериалы' },
+        { type: 'anime', title: 'Аниме' }
     ];
 
     // У фильма нет «Смотрю» и «Отложено»: он смотрится целиком
-    var LIBRARY_TYPES = [
-        { type: 'movies', title: 'Фильмы', statuses: ['plantowatch', 'completed', 'dropped'] },
-        { type: 'shows', title: 'Сериалы', statuses: ['watching', 'plantowatch', 'hold', 'completed', 'dropped'] },
-        { type: 'anime', title: 'Аниме', statuses: ['watching', 'plantowatch', 'hold', 'completed', 'dropped'] }
+    var ACTIVE_STATUSES = {
+        movies: ['plantowatch'],
+        shows: ['watching', 'plantowatch', 'hold'],
+        anime: ['watching', 'plantowatch', 'hold']
+    };
+
+    var ARCHIVE_STATUSES = ['completed', 'dropped'];
+
+    var PANEL_RECS = [
+        { url: 'recs_tmdb', title: 'Рекомендации TMDB' },
+        { url: 'recs_simkl', title: 'Рекомендации Simkl' }
     ];
 
     var TOKEN_KEY = 'simkl_token';
@@ -2936,7 +2945,7 @@
     // подпись у неё одна: «где остановился» важнее года.
     function panelLabels() {
         var merged = {};
-        var order = PANEL_TOP.map(function (row) { return row.url; }).concat(Object.keys(labels));
+        var order = ['unfinished'].concat(PANEL_RECS.map(function (row) { return row.url; }), Object.keys(labels));
 
         order.forEach(function (url) {
             if (String(url).indexOf('similar:') === 0) return;
@@ -3070,6 +3079,11 @@
 
     // Ряд панели: первые двадцать карточек раздела. Пустой ряд Lampa не
     // рисует сама — достаточно ответить ничем.
+    // Ряд панели: первые двадцать карточек раздела, в заголовке — сколько
+    // в нём всего. «Ещё» Lampa рисует только при total_pages > 1, а он нужен
+    // у каждого ряда — открыть раздел гридом, — поэтому страниц у ряда не
+    // меньше двух. Грид считает страницы сам, по настоящему числу записей.
+    // Пустой ряд Lampa не рисует — достаточно ответить ничем.
     function panelRow(url, title) {
         return function (call) {
             loadEntries(url, function (entries) {
@@ -3078,12 +3092,12 @@
 
                 collect(url, slice, function (results) {
                     call({
-                        title: title,
+                        title: title + ' (' + entries.length + ')',
                         results: results,
                         url: url,
                         source: SOURCE,
                         page: 1,
-                        total_pages: Math.ceil(entries.length / PAGE_SIZE)
+                        total_pages: Math.max(2, Math.ceil(entries.length / PAGE_SIZE))
                     });
                     scheduleLabels();
                 }, function () { call(); });
@@ -3091,14 +3105,90 @@
         };
     }
 
-    function panelParts() {
-        var parts = PANEL_TOP.map(function (row) { return panelRow(row.url, row.title); });
+    // Просмотренное и брошенное — плитками-папками, как категории в родном
+    // «Избранном»: три постера и число. Это родной модуль карточки Folder,
+    // маску ему даёт Lampa.Maker. Подпись папка берёт из перевода
+    // menu_<media>, поэтому media у плитки своё, и перевод регистрируем сами.
+    function panelFolders(call) {
+        var folders = [];
 
         LIBRARY_TYPES.forEach(function (group) {
-            group.statuses.forEach(function (status) {
+            ARCHIVE_STATUSES.forEach(function (status) {
+                folders.push({
+                    url: 'library:' + group.type + ':' + status,
+                    media: 'simkl_' + group.type + '_' + status,
+                    title: group.title + ' · ' + LISTS[status]
+                });
+            });
+        });
+
+        var translations = {};
+        folders.forEach(function (folder) {
+            translations['menu_' + folder.media] = { ru: folder.title, en: folder.title, uk: folder.title, be: folder.title };
+        });
+        Lampa.Lang.add(translations);
+
+        var module = Lampa.Maker.module('Card').only('Folder', 'Callback');
+        var tiles = [];
+        var waiting = folders.length;
+
+        function finish() {
+            if (--waiting) return;
+
+            tiles = tiles.filter(Boolean);
+            if (!tiles.length) return call();
+
+            call({ title: 'Просмотрено и брошено', results: tiles, total_pages: 1 });
+        }
+
+        folders.forEach(function (folder, index) {
+            loadEntries(folder.url, function (entries) {
+                if (!entries.length) return finish();
+
+                // Постеры для плитки — первые три карточки, дальше пустышки:
+                // число на папке — это длина results
+                collect(folder.url, entries.slice(0, 3), function (cards) {
+                    var results = cards.slice();
+                    while (results.length < entries.length) results.push({});
+
+                    tiles[index] = {
+                        results: results,
+                        media: folder.media,
+                        simkl_folder: { url: folder.url, title: folder.title },
+                        params: { module: module }
+                    };
+                    finish();
+                }, finish);
+            }, finish);
+        });
+    }
+
+    // Клик по любой карточке на экране main открывает full — плитке
+    // папки его не переопределить. Поэтому такой переход подменяем на грид
+    // её раздела.
+    function followFolders() {
+        var push = Lampa.Activity.push;
+
+        Lampa.Activity.push = function (params) {
+            var folder = params && params.component === 'full' && params.card && params.card.simkl_folder;
+            if (folder) return openSection(folder.url, folder.title);
+
+            return push.apply(this, arguments);
+        };
+    }
+
+    function panelParts() {
+        var parts = [panelRow('unfinished', 'Продолжить просмотр')];
+
+        LIBRARY_TYPES.forEach(function (group) {
+            ACTIVE_STATUSES[group.type].forEach(function (status) {
                 parts.push(panelRow('library:' + group.type + ':' + status, group.title + ' · ' + LISTS[status]));
             });
         });
+
+        parts.push(panelFolders);
+
+        PANEL_RECS.forEach(function (row) { parts.push(panelRow(row.url, row.title)); });
 
         return parts;
     }
@@ -3221,6 +3311,7 @@
         addSettings();
         startAutomark();
         scheduleExport();
+        followFolders();
 
         if (!configured()) {
             console.warn('Simkl: не задан CLIENT_ID, плагин ничего не покажет');

@@ -1720,14 +1720,12 @@
     // TorrServer — он помнит, какие файлы раздачи проигрывались (POST /viewed,
     // action list). Поэтому при запуске торрента запоминаем раздачу — хэш и
     // какой файл какой серии, — а потом спрашиваем у TorrServer, что из неё
-    // играло, и отмечаем эти серии. Спрашиваем при старте, при возврате на
-    // вкладку и раз в пять минут, пока раздача свежая. Уже просмотренное в
-    // Simkl не отправляется — это решает markWatched по свежему статусу.
+    // играло, и отмечаем эти серии. Спрашиваем при возврате на вкладку и при
+    // старте Lampa, пока раздача свежая. Уже просмотренное в Simkl не
+    // отправляется — это решает markWatched по свежему статусу.
     var TORRENT_TTL = 3 * 24 * 60 * 60 * 1000;
-    var TORRENT_POLL = 5 * 60 * 1000;
 
     var torrents = {};
-    var torrent_timer = null;
 
     function loadTorrents() {
         try {
@@ -1773,7 +1771,6 @@
 
         torrents[hash] = session;
         persistTorrents();
-        watchTorrents();
     }
 
     function pendingTorrents() {
@@ -1814,20 +1811,6 @@
         });
     }
 
-    function watchTorrents() {
-        if (torrent_timer || !pendingTorrents().length) return;
-
-        torrent_timer = setInterval(function () {
-            if (!pendingTorrents().length) {
-                clearInterval(torrent_timer);
-                torrent_timer = null;
-                return;
-            }
-
-            checkTorrents();
-        }, TORRENT_POLL);
-    }
-
     function startTorrents() {
         loadTorrents();
 
@@ -1836,10 +1819,7 @@
             if (document.visibilityState === 'visible' && pendingTorrents().length) checkTorrents();
         });
 
-        if (pendingTorrents().length) {
-            setTimeout(checkTorrents, 10000);
-            watchTorrents();
-        }
+        if (pendingTorrents().length) setTimeout(checkTorrents, 10000);
     }
 
     function isAndroid() {

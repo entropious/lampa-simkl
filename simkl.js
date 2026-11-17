@@ -336,6 +336,8 @@
     var AUTOMARK_KEY = 'simkl_automark';
     var EXPORT_KEY = 'simkl_export_at';
     var SEQUELS_KEY = 'simkl_sequels_planned';
+    var NOT_FOUND_KEY = 'simkl_not_found';
+    var TORRENTS_KEY = 'simkl_torrents';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
 
@@ -1707,6 +1709,137 @@
         if (!place) return console.warn('Simkl: не удалось понять, какая серия запущена');
 
         markWatched(launchEntry(card, method, place));
+
+        if (data.torrent_hash) registerTorrent(data, card, method);
+    }
+
+    // --- Торренты во внешнем плеере ---------------------------------------------
+
+    // Плейлист торрента внешний плеер играет сам: IINA переходит к следующей
+    // серии, не возвращаясь в Lampa, и Lampa об этом не узнаёт. Зато знает
+    // TorrServer — он помнит, какие файлы раздачи проигрывались (POST /viewed,
+    // action list). Поэтому при запуске торрента запоминаем раздачу — хэш и
+    // какой файл какой серии, — а потом спрашиваем у TorrServer, что из неё
+    // играло, и отмечаем эти серии. Спрашиваем при старте, при возврате на
+    // вкладку и раз в пять минут, пока раздача свежая. Уже просмотренное в
+    // Simkl не отправляется — это решает markWatched по свежему статусу.
+    var TORRENT_TTL = 3 * 24 * 60 * 60 * 1000;
+    var TORRENT_POLL = 5 * 60 * 1000;
+
+    var torrents = {};
+    var torrent_timer = null;
+
+    function loadTorrents() {
+        try {
+            var saved = Lampa.Storage.get(TORRENTS_KEY, '{}') || {};
+
+            Object.keys(saved).forEach(function (hash) {
+                if (saved[hash] && Date.now() - saved[hash].at < TORRENT_TTL) torrents[hash] = saved[hash];
+            });
+        } catch (e) {
+            console.error('Simkl: не удалось прочитать торренты', e);
+        }
+    }
+
+    function persistTorrents() {
+        try {
+            Lampa.Storage.set(TORRENTS_KEY, torrents);
+        } catch (e) {
+            console.error('Simkl: не удалось записать торренты', e);
+        }
+    }
+
+    // Номер файла раздачи у элемента — id: по нему же TorrServer и отдаёт
+    // просмотренное (file_index)
+    function registerTorrent(data, card, method) {
+        var hash = String(data.torrent_hash).toLowerCase();
+        var session = torrents[hash] || { files: {}, done: [] };
+
+        session.at = Date.now();
+        session.card = launchCard(card);
+        session.method = method;
+
+        [data].concat(Array.isArray(data.playlist) ? data.playlist : []).forEach(function (item) {
+            var index = item && Number(item.id);
+            if (!index && index !== 0) return;
+
+            var place = itemPlace(card, method, item);
+            if (place) session.files[index] = { season: place.season, episode: place.episode };
+        });
+
+        // Запущенная серия уже отмечена
+        var started = Number(data.id);
+        if ((started || started === 0) && session.done.indexOf(started) === -1) session.done.push(started);
+
+        torrents[hash] = session;
+        persistTorrents();
+        watchTorrents();
+    }
+
+    function pendingTorrents() {
+        return Object.keys(torrents).filter(function (hash) {
+            return Date.now() - torrents[hash].at < TORRENT_TTL;
+        });
+    }
+
+    function checkTorrents() {
+        var base = '';
+
+        try {
+            base = Lampa.Torserver.url();
+        } catch (e) {}
+
+        if (!base || !automark()) return;
+
+        pendingTorrents().forEach(function (hash) {
+            // Свой запрос, не Torserver.viewed: тот перед запросом обрывает
+            // остальные запросы Lampa к TorrServer. Авторизацию TorrServer
+            // Lampa.Reguest подставляет сам.
+            new Lampa.Reguest().silent(base + '/viewed', function (list) {
+                var session = torrents[hash];
+                if (!session || !Array.isArray(list)) return;
+
+                list.forEach(function (viewed) {
+                    var index = Number(viewed && viewed.file_index);
+                    var place = session.files[index];
+
+                    if (!place || session.done.indexOf(index) !== -1) return;
+
+                    session.done.push(index);
+                    markWatched(launchEntry(session.card, session.method, place));
+                });
+
+                persistTorrents();
+            }, function () {}, JSON.stringify({ action: 'list', hash: hash }));
+        });
+    }
+
+    function watchTorrents() {
+        if (torrent_timer || !pendingTorrents().length) return;
+
+        torrent_timer = setInterval(function () {
+            if (!pendingTorrents().length) {
+                clearInterval(torrent_timer);
+                torrent_timer = null;
+                return;
+            }
+
+            checkTorrents();
+        }, TORRENT_POLL);
+    }
+
+    function startTorrents() {
+        loadTorrents();
+
+        // Вернулись на вкладку с Lampa — самое время спросить, что играло
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'visible' && pendingTorrents().length) checkTorrents();
+        });
+
+        if (pendingTorrents().length) {
+            setTimeout(checkTorrents, 10000);
+            watchTorrents();
+        }
     }
 
     function isAndroid() {
@@ -1795,6 +1928,7 @@
     function startAutomark() {
         loadLaunches();
         followTimeline();
+        startTorrents();
 
         if (!Lampa.Player || !Lampa.Player.listener) return;
 
@@ -1914,6 +2048,18 @@
         return order.map(function (key) { return { key: key, item: wanted[key] }; });
     }
 
+    // Чего Simkl не нашёл, помним: иначе тот же фильм уходил бы в каждой
+    // ежедневной выгрузке и каждый раз давал плашку «не найдено». Сама
+    // выгрузка такие пропускает молча, кнопка «Синхронизировать» пробует
+    // заново — вдруг Simkl его уже завёл.
+    function notFound() {
+        try {
+            return Lampa.Storage.get(NOT_FOUND_KEY, '{}') || {};
+        } catch (e) {
+            return {};
+        }
+    }
+
     function exportFavorites(manual, after) {
         var finish = after || function () {};
 
@@ -1936,7 +2082,16 @@
             var have = libraryKeys(rows);
             var planned = libraryKeys(rows, ['plantowatch']);
 
-            var missing = cards.filter(function (entry) { return !have[entry.key]; }).map(function (entry) {
+            var lost_before = notFound();
+
+            // Найденное с тех пор в библиотеке больше не «ненайденное»
+            Object.keys(lost_before).forEach(function (key) {
+                if (have[key]) delete lost_before[key];
+            });
+
+            var missing = cards.filter(function (entry) {
+                return !have[entry.key] && (manual || !lost_before[entry.key]);
+            }).map(function (entry) {
                 return entry.item;
             });
 
@@ -1951,13 +2106,33 @@
             });
 
             Lampa.Storage.set(EXPORT_KEY, Date.now());
+            Lampa.Storage.set(NOT_FOUND_KEY, lost_before);
 
             if (!missing.length && !repair.length) {
                 if (manual) Lampa.Noty.show('Simkl: всё из «Избранного» уже там');
                 return finish();
             }
 
-            sendExport(missing, function (added, lost) {
+            sendExport(missing, function (added, lost_keys) {
+                var lost_now = notFound();
+                var fresh = 0;
+
+                lost_keys.forEach(function (key) {
+                    if (!lost_now[key]) fresh++;
+                    lost_now[key] = Date.now();
+                });
+
+                missing.forEach(function (item) {
+                    var key = item.method + ':' + Number(item.card.id);
+                    if (lost_keys.indexOf(key) === -1) delete lost_now[key];
+                });
+
+                Lampa.Storage.set(NOT_FOUND_KEY, lost_now);
+
+                // О ненайденном говорим один раз, когда его не нашли впервые;
+                // по кнопке — всегда
+                var lost = manual ? lost_keys.length : fresh;
+
                 repairWatched(repair, function (repaired) {
                     entries_cache = {};
                     library_cache = null;
@@ -1980,9 +2155,11 @@
 
     // add-to-list — только статус, события просмотра он не пишет, так что
     // пересмотров выгрузка не создаёт. Пачками по сотне, одна за другой.
+    // done(added, lost_keys): сколько добавлено и ключи method:tmdb того, чего
+    // Simkl не нашёл. not_found повторяет присланное, tmdb-id там есть.
     function sendExport(items, done) {
         var added = 0;
-        var lost = 0;
+        var lost = [];
 
         function next(index) {
             var batch = items.slice(index, index + EXPORT_BATCH);
@@ -2007,11 +2184,19 @@
                     var missing = (data && data.not_found) || {};
 
                     added += (ok.movies || []).length + (ok.shows || []).length;
-                    lost += (missing.movies || []).length + (missing.shows || []).length;
+
+                    [['movies', 'movie'], ['shows', 'tv']].forEach(function (pair) {
+                        (missing[pair[0]] || []).forEach(function (item) {
+                            var tmdb = Number(item && item.ids && item.ids.tmdb);
+                            if (tmdb) lost.push(pair[1] + ':' + tmdb);
+                        });
+                    });
+
                     next(index + EXPORT_BATCH);
                 },
+                // Сбой сети — не «не найдено»: в следующий раз попробуем снова
                 onFail: function () {
-                    done(added, lost + items.length - index);
+                    done(added, lost);
                 }
             });
         }
@@ -2681,6 +2866,8 @@
                     if (!(key in status) || LIST_RANK[item.status] < LIST_RANK[status[key]]) status[key] = item.status;
                 });
 
+                var lost = notFound();
+
                 done(cards.map(function (entry) {
                     var card = entry.card;
                     var method = Core.cardMethod(card);
@@ -2692,7 +2879,10 @@
                     // Фильм в «Смотрю» Simkl сам переводит в «Просмотрено»
                     if (method === 'movie' && want === 'watching' && found === 'completed') return null;
 
-                    var where = foreign ? 'не из TMDB' : (found ? 'в Simkl: ' + LISTS[found] : 'нет в Simkl');
+                    var where = foreign ? 'не из TMDB'
+                        : found ? 'в Simkl: ' + LISTS[found]
+                        : lost[method + ':' + Number(card.id)] ? 'Simkl такого не знает'
+                        : 'нет в Simkl';
 
                     return {
                         method: method,

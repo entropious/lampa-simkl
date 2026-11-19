@@ -1822,6 +1822,254 @@
         if (pendingTorrents().length) setTimeout(checkTorrents, 10000);
     }
 
+    // --- Отметки серий в списке файлов торрента -----------------------------
+
+    // В меню серии торрента (долгое нажатие) — отметить её просмотренной или
+    // нет сразу в двух местах: в TorrServer, который помнит, какие файлы
+    // раздачи проигрывались (по этим отметкам рисует галочки и выбирает
+    // серию автостарт «Онлайн», а Simkl отмечает серии, проигранные
+    // плейлистом во внешнем плеере), и в истории Simkl. Запуск не той серии
+    // оставлял лишние отметки и там, и там.
+    var file_lists = {};
+
+    function fileList(hash) {
+        if (!file_lists[hash]) file_lists[hash] = { card: null, method: '', files: {}, viewed: null, asked: false };
+        return file_lists[hash];
+    }
+
+    function torrentServer() {
+        try {
+            return String(Lampa.Torserver.url() || '').replace(/\/+$/, '');
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Свой запрос, не Torserver.viewed: тот обрывает остальные запросы
+    // Lampa к TorrServer. Авторизацию Lampa.Reguest подставляет сам.
+    function torrentViewedRequest(body, done, fail, text) {
+        var base = torrentServer();
+        if (!base) return fail && fail();
+
+        var net = new Lampa.Reguest();
+        net.timeout(5000);
+        net.silent(base + '/viewed', done, fail || function () {}, JSON.stringify(body), text ? { dataType: 'text' } : undefined);
+    }
+
+    function torrentFileEvent(e) {
+        if (!e || e.type === 'list_open' || e.type === 'list_close') {
+            file_lists = {};
+            return;
+        }
+
+        var element = e.element;
+        if (!element || !element.torrent_hash) return;
+
+        var hash = element.torrent_hash;
+        var list = fileList(hash);
+        var card = e.params && e.params.movie;
+
+        if (e.type === 'render') {
+            if (card && Number(card.id)) {
+                list.card = launchCard(card);
+                list.method = Core.cardMethod(card);
+            }
+
+            var season = Number(element.season);
+            var episode = Number(element.episode);
+            list.files[element.id] = list.method === 'tv' ? (season && episode ? { season: season, episode: episode } : null) : {};
+
+            if (!list.asked) {
+                list.asked = true;
+                torrentViewedRequest({ action: 'list', hash: hash }, function (answer) {
+                    list.viewed = {};
+                    (Array.isArray(answer) ? answer : []).forEach(function (v) {
+                        if (v && v.file_index !== undefined) list.viewed[v.file_index] = true;
+                    });
+                });
+            }
+        }
+
+        if (e.type === 'onenter' && list.viewed) list.viewed[element.id] = true;
+
+        if (e.type === 'onlong' && Array.isArray(e.menu) && torrentServer()) {
+            var on = !!(list.viewed && list.viewed[element.id]);
+            var place = list.files[element.id];
+            var simkl = ready() && list.card && place;
+
+            e.menu.push({
+                title: on ? 'Отметить непросмотренной' : 'Отметить просмотренной',
+                subtitle: simkl ? (on ? 'TorrServer и удалить из Simkl' : 'TorrServer и Simkl') : 'TorrServer',
+                simkl_action: function () {
+                    setTorrentFile(hash, list, element.id, !on);
+                }
+            });
+
+            if (list.viewed && Object.keys(list.viewed).length) {
+                e.menu.push({
+                    title: 'Снять отметки со всех серий',
+                    subtitle: ready() && list.card ? 'TorrServer и удалить из Simkl' : 'TorrServer',
+                    simkl_action: function () {
+                        clearTorrentFiles(hash, list);
+                    }
+                });
+            }
+        }
+    }
+
+    // Отметки TorrServer поменялись — сообщаем тем, кто их рисует («Онлайн»)
+    function torrentViewedChanged(hash, index, on) {
+        Lampa.Listener.send('torrent_viewed', { hash: hash, index: index, on: on });
+    }
+
+    // Серия, которую сняли сами, не должна вернуться автоотметкой: TorrServer
+    // помнит её, пока мы его не попросили забыть, а checkTorrents отмечает
+    // по его списку всё, чего нет в done
+    function sessionFile(hash, index, on) {
+        var session = torrents[String(hash).toLowerCase()];
+        if (!session) return;
+
+        var at = session.done.indexOf(index);
+        if (on && at === -1) session.done.push(index);
+        if (!on && at !== -1) session.done.splice(at, 1);
+        persistTorrents();
+    }
+
+    function setTorrentFile(hash, list, index, on) {
+        torrentViewedRequest({ action: on ? 'set' : 'rem', hash: hash, file_index: index }, function () {
+            if (list.viewed) {
+                if (on) list.viewed[index] = true;
+                else delete list.viewed[index];
+            }
+            sessionFile(hash, index, on);
+            torrentViewedChanged(hash, index, on);
+        }, function () {
+            Lampa.Noty.show('TorrServer не ответил');
+        }, true);
+
+        var place = list.files[index];
+        if (!ready() || !list.card || !place) return;
+
+        var entry = launchEntry(list.card, list.method, place);
+        if (on) markWatched(entry);
+        else unmarkWatched(entry, [place]);
+    }
+
+    function clearTorrentFiles(hash, list) {
+        var indexes = list.viewed ? Object.keys(list.viewed).map(Number) : [];
+
+        torrentViewedRequest({ action: 'rem', hash: hash, file_index: -1 }, function () {
+            list.viewed = {};
+            indexes.forEach(function (index) {
+                sessionFile(hash, index, false);
+                torrentViewedChanged(hash, index, false);
+            });
+        }, function () {
+            Lampa.Noty.show('TorrServer не ответил');
+        }, true);
+
+        if (!ready() || !list.card) return;
+
+        // Из Simkl — серии, которые были отмечены в этой раздаче
+        var places = indexes.map(function (index) { return list.files[index]; }).filter(Boolean);
+        if (list.method !== 'tv') places = places.length ? [{}] : [];
+        if (places.length) unmarkWatched(launchEntry(list.card, list.method, places[0]), places);
+    }
+
+    // Убрать из истории Simkl фильм или серии. У аниме из нескольких частей
+    // серия лежит в своей части под её нумерацией — как и при отметке.
+    function unmarkWatched(entry, places) {
+        var ctx = entryCtx(entry);
+
+        if (entry.method !== 'tv') return unmarkMovie(ctx);
+
+        delete episodes_cache[cacheKey('tv', entry.card.id)];
+
+        fetchEpisodes(ctx, function (status) {
+            var seasons = {};
+            var parts = {};
+            var known = {};
+
+            ((status && status.seasons) || []).forEach(function (season) {
+                (season.episodes || []).forEach(function (episode) {
+                    known[season.number + ':' + episode.number] = episode;
+                });
+            });
+
+            places.forEach(function (place) {
+                var episode = known[place.season + ':' + place.episode];
+                // Чего Simkl не считает просмотренным, не трогаем
+                if (episode && !episode.watched) return;
+
+                if (episode && episode.part) {
+                    (parts[episode.part] = parts[episode.part] || []).push({ number: episode.local });
+                } else {
+                    (seasons[place.season] = seasons[place.season] || []).push({ number: place.episode });
+                }
+            });
+
+            var body = {};
+            var season_list = Object.keys(seasons).map(function (number) {
+                return { number: Number(number), episodes: seasons[number] };
+            });
+            if (season_list.length) body = mediaBody(entry.card, 'tv', { seasons: season_list });
+
+            var anime = Object.keys(parts).map(function (part) {
+                return { ids: { simkl: Number(part) }, episodes: parts[part] };
+            });
+            if (anime.length) body.anime = anime;
+
+            if (!season_list.length && !anime.length) return;
+
+            var text = places.length === 1 ? episodeCode(places[0]) : 'серии раздачи';
+
+            api({
+                path: '/sync/history/remove',
+                method: 'POST',
+                auth: true,
+                body: body,
+                onDone: function () {
+                    invalidate('tv', entry.card.id);
+                    Lampa.Noty.show('Simkl: ' + text + ' — отметка снята');
+                    refresh(ctx);
+                },
+                onFail: function () {
+                    Lampa.Noty.show('Simkl: не удалось снять отметку');
+                }
+            });
+        });
+    }
+
+    // Действия своих пунктов в чужих меню (меню серии торрента): onSelect
+    // там Lampa, и наших флагов она не знает — зовём действие после неё
+    function wrapSelect() {
+        if (!Lampa.Select || !Lampa.Select.show || Lampa.Select.show.simkl_wrapped) return;
+
+        var show = Lampa.Select.show;
+        var wrapped = function (params) {
+            var items = params && Array.isArray(params.items) ? params.items : null;
+
+            if (items && items.some(function (item) { return item && typeof item.simkl_action === 'function'; })) {
+                var select = params.onSelect;
+                params.onSelect = function (item) {
+                    var result = select ? select.apply(this, arguments) : undefined;
+                    if (item && typeof item.simkl_action === 'function') item.simkl_action();
+                    return result;
+                };
+            }
+
+            return show.apply(this, arguments);
+        };
+
+        wrapped.simkl_wrapped = true;
+        Lampa.Select.show = wrapped;
+    }
+
+    function startTorrentMenu() {
+        wrapSelect();
+        Lampa.Listener.follow('torrent_file', torrentFileEvent);
+    }
+
     function isAndroid() {
         try {
             return Lampa.Platform.is('android');
@@ -3761,6 +4009,7 @@
         loadRecs();
         addSettings();
         startAutomark();
+        startTorrentMenu();
         scheduleExport();
         followFolders();
 

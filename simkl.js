@@ -2631,6 +2631,12 @@
     // десять лучших комментариев по рейтингу.
     var MYSHOWS_API = 'https://api.myshows.me/v2/rpc/';
     var COMMENTS_TOP = 10;
+
+    // Пилот — место отзывов о сериале целиком: у S01E01 в 1,5–3,6 раза больше
+    // комментариев, чем у серий в середине сезона, и треть из них — о сериале
+    // вообще. Поэтому «О сериале» — это лучшие комментарии пилота, и их больше.
+    // Финал сезона так же собирает итоги сезона.
+    var PILOT_TOP = 20;
     var COMMENTS_WORKERS = 3;
 
     var COMMENTS_ICON = '<svg viewBox="0 0 24 24" fill="currentColor">' +
@@ -2721,23 +2727,53 @@
                 var numbers = Object.keys(seasons).map(Number).sort(function (a, b) { return a - b; });
                 if (!numbers.length) return Lampa.Noty.show('MyShows: у сериала нет серий');
 
+                numbers.forEach(function (number) {
+                    seasons[number].episodes.sort(function (a, b) { return a.episodeNumber - b.episodeNumber; });
+                });
+
+                var items = numbers.map(function (number) {
+                    var season = seasons[number];
+                    return {
+                        title: 'Сезон ' + number,
+                        subtitle: season.episodes.length + ' ' + episodesNominative(season.episodes.length) +
+                            ' · ' + season.comments + ' ' + commentsWord(season.comments),
+                        number: number
+                    };
+                });
+
+                var pilot = seasons[numbers[0]].episodes[0];
+
+                if (pilot && pilot.commentsCount) {
+                    items.unshift({
+                        title: 'О сериале',
+                        subtitle: 'лучшие комментарии к пилоту — ' + pilot.commentsCount + ' ' + commentsWord(pilot.commentsCount),
+                        pilot: true
+                    });
+                }
+
                 Lampa.Select.show({
                     title: 'Комментарии MyShows',
-                    items: numbers.map(function (number) {
-                        var season = seasons[number];
-                        return {
-                            title: 'Сезон ' + number,
-                            subtitle: season.episodes.length + ' ' + episodesNominative(season.episodes.length) +
-                                ' · ' + season.comments + ' ' + commentsWord(season.comments),
-                            number: number
-                        };
-                    }),
+                    items: items,
                     onSelect: function (chosen) {
-                        var episodes = seasons[chosen.number].episodes.sort(function (a, b) {
-                            return a.episodeNumber - b.episodeNumber;
+                        if (chosen.pilot) {
+                            return showComments(ctx, Core.cardTitle(ctx.card) + ' · о сериале', numbers[0], [
+                                { episode: pilot, top: PILOT_TOP }
+                            ], back);
+                        }
+
+                        var episodes = seasons[chosen.number].episodes;
+                        var finale = seasonFinale(episodes);
+
+                        // Финал — первым, как итоги сезона; дальше по порядку
+                        var blocks = episodes.filter(function (episode) {
+                            return episode !== finale;
+                        }).map(function (episode) {
+                            return { episode: episode, top: COMMENTS_TOP };
                         });
 
-                        showSeasonComments(ctx, show, chosen.number, episodes, back);
+                        if (finale) blocks.unshift({ episode: finale, top: COMMENTS_TOP, label: 'Итоги сезона' });
+
+                        showComments(ctx, Core.cardTitle(ctx.card) + ' · сезон ' + chosen.number, chosen.number, blocks, back);
                     },
                     onBack: function () { Lampa.Controller.toggle(back); }
                 });
@@ -2759,18 +2795,31 @@
         }
     }
 
-    function topComments(list) {
+    function topComments(list, top) {
         return (list || []).filter(function (comment) {
             return comment && !comment.isDeleted && !comment.isBad && comment.comment;
         }).sort(function (a, b) {
             return (b.rating || 0) - (a.rating || 0);
-        }).slice(0, COMMENTS_TOP);
+        }).slice(0, top || COMMENTS_TOP);
     }
 
-    function showSeasonComments(ctx, show, number, episodes, back) {
+    // Финал — последняя серия сезона, если она уже вышла. У идущего сезона
+    // последняя вышедшая серия ещё не финал, итогов у него нет.
+    function seasonFinale(episodes) {
+        var last = episodes[episodes.length - 1];
+        if (!last || episodes.length < 3) return null;
+
+        var aired = Date.parse(last.airDateUTC || last.airDate);
+        return aired && aired <= Date.now() ? last : null;
+    }
+
+    // blocks: [{ episode, top, label }] — серии в том порядке, в каком их
+    // показывать, сколько лучших комментариев у каждой и подпись над ней
+    function showComments(ctx, title, number, blocks, back) {
         var results = [];
         var names = {};
         var waiting = 2;
+        var episodes = blocks.map(function (block) { return block.episode; });
 
         Lampa.Noty.show('MyShows: загружаем комментарии…');
 
@@ -2789,7 +2838,8 @@
             }
 
             myshows('shows.EpisodeComments', { episodeId: episode.id }, function (data) {
-                results[episodes.indexOf(episode)] = { episode: episode, comments: topComments(data && data.comments) };
+                var block = blocks[episodes.indexOf(episode)];
+                results[episodes.indexOf(episode)] = { episode: episode, comments: topComments(data && data.comments, block.top) };
                 next();
             }, function () {
                 results[episodes.indexOf(episode)] = { episode: episode, comments: [], failed: true };
@@ -2802,11 +2852,12 @@
 
             var html = $('<div class="simkl-comments"></div>');
 
-            results.forEach(function (row) {
+            results.forEach(function (row, index) {
                 var episode = row.episode;
                 var head = $('<div class="simkl-comments__episode"></div>');
+                var label = blocks[index].label;
 
-                head.text(episodeCode({ season: number, episode: episode.episodeNumber }) + ' · ' +
+                head.text((label ? label + ' · ' : '') + episodeCode({ season: number, episode: episode.episodeNumber }) + ' · ' +
                     (names[episode.episodeNumber] || plainText(episode.title)) + ' ');
                 head.append($('<span class="simkl-comments__count"></span>').text(
                     (episode.commentsCount || 0) + ' ' + commentsWord(episode.commentsCount || 0)
@@ -2834,7 +2885,7 @@
             });
 
             Lampa.Modal.open({
-                title: (Core.cardTitle(ctx.card) || show.title) + ' · сезон ' + number,
+                title: title,
                 html: html,
                 size: 'large',
                 onBack: function () {

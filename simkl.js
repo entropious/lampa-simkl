@@ -340,6 +340,7 @@
     var TORRENTS_KEY = 'simkl_torrents';
     var LINE_KEY = 'simkl_card_line';
     var BUTTON_KEY = 'simkl_card_button';
+    var COMMENTS_KEY = 'simkl_card_comments';
 
     // Статус меняют и на самом simkl.com, поэтому кэш живёт недолго: он
     // спасает от повторного запроса при переходах туда-сюда по карточкам,
@@ -392,6 +393,21 @@
             -webkit-user-select: text; -moz-user-select: text; -ms-user-select: text; user-select: text;
             -webkit-touch-callout: default; cursor: text;
         }
+        .simkl-comments { padding: 0 0.3em 1em; }
+        .simkl-comments__episode {
+            font-size: 1.3em; font-weight: 600; margin: 1.4em 0 0.5em;
+        }
+        .simkl-comments__episode:first-child { margin-top: 0.2em; }
+        .simkl-comments__count { font-weight: 400; opacity: 0.6; font-size: 0.75em; }
+        .simkl-comments__empty { opacity: 0.6; margin-bottom: 0.6em; }
+        .simkl-comment {
+            padding: 0.7em 0.9em; margin-bottom: 0.5em; border-radius: 0.6em;
+            background: rgba(255, 255, 255, 0.06);
+        }
+        .simkl-comment.focus { background: rgba(255, 255, 255, 0.18); }
+        .simkl-comment__meta { opacity: 0.6; font-size: 0.85em; margin-bottom: 0.3em; }
+        .simkl-comment__text { line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+        .simkl-comment__text a { color: inherit; }
     `;
 
     // Карточки живут в памяти и в Storage: при возврате на уже открытый фильм
@@ -2592,7 +2608,241 @@
             });
         }
 
+        // Комментарии MyShows — только у сериалов: фильмов в его API нет
+        if (ctx.method === 'tv' && Lampa.Storage.get(COMMENTS_KEY, true)) {
+            Core.cardButton(ctx, {
+                className: 'simkl-comments-button',
+                icon: COMMENTS_ICON,
+                title: 'Комментарии',
+                after: '.simkl-status-button',
+                onEnter: function () { openComments(ctx); }
+            });
+        }
+
         refresh(ctx);
+    }
+
+    // --- Комментарии MyShows --------------------------------------------------
+
+    // Русских комментариев к сериалам больше всего на MyShows, и до него можно
+    // достучаться из браузера: JSON-RPC без ключа, CORS открыт. Комментарии
+    // там привязаны к сериям, у сериала целиком их нет. Поэтому кнопка
+    // «Комментарии» спрашивает сезон, а потом показывает по каждой его серии
+    // десять лучших комментариев по рейтингу.
+    var MYSHOWS_API = 'https://api.myshows.me/v2/rpc/';
+    var COMMENTS_TOP = 10;
+    var COMMENTS_WORKERS = 3;
+
+    var COMMENTS_ICON = '<svg viewBox="0 0 24 24" fill="currentColor">' +
+        '<path d="M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-5 4v-4H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm3 5v2h10V8H7zm0 4v2h7v-2H7z"></path>' +
+        '</svg>';
+
+    // Сериал MyShows по карточке Lampa — один раз за сеанс
+    var myshows_ids = {};
+
+    function myshows(method, params, done, fail) {
+        Core.request({
+            url: MYSHOWS_API,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept-Language': 'ru' },
+            body: { jsonrpc: '2.0', method: method, params: params, id: 1 },
+            onDone: function (data) {
+                // Ошибки JSON-RPC приходят с HTTP 200, в теле
+                if (data && data.result) done(data.result);
+                else fail(data && data.error);
+            },
+            onFail: function () { fail(null); }
+        });
+    }
+
+    // tmdb-id MyShows не понимает, а IMDb — да (shows.GetByExternalId). IMDb
+    // берём у TMDB. Нет его — ищем по оригинальному названию и году.
+    function findMyshows(card, done, fail) {
+        if (myshows_ids[card.id]) return done(myshows_ids[card.id]);
+
+        function remember(id) {
+            myshows_ids[card.id] = id;
+            done(id);
+        }
+
+        function search() {
+            var title = card.original_name || card.original_title || card.name || card.title;
+            var year = Core.cardYear(card);
+
+            myshows('shows.Search', { query: title }, function (list) {
+                var found = (list || []).filter(function (show) {
+                    return !year || !show.year || Math.abs(show.year - year) <= 1;
+                })[0];
+
+                if (found) remember(found.id);
+                else fail();
+            }, fail);
+        }
+
+        tmdbGet('tv/' + card.id + '/external_ids', function (ids) {
+            var imdb = ids && ids.imdb_id;
+            if (!imdb) return search();
+
+            // Числом: «tt0903747» с ведущим нулём MyShows не находит, а 903747 — да
+            myshows('shows.GetByExternalId', { id: Number(String(imdb).replace(/^tt/, '')), source: 'imdb' }, function (show) {
+                if (show && show.id) remember(show.id);
+                else search();
+            }, search);
+        });
+    }
+
+    function commentsWord(count) {
+        var n = count % 100;
+        var n1 = n % 10;
+
+        if (n > 10 && n < 20) return 'комментариев';
+        if (n1 === 1) return 'комментарий';
+        if (n1 > 1 && n1 < 5) return 'комментария';
+        return 'комментариев';
+    }
+
+    function openComments(ctx) {
+        var back = Lampa.Controller.enabled().name;
+
+        Lampa.Noty.show('MyShows: ищем сериал…');
+
+        findMyshows(ctx.card, function (id) {
+            myshows('shows.GetById', { showId: id, withEpisodes: true }, function (show) {
+                var seasons = {};
+
+                (show.episodes || []).forEach(function (episode) {
+                    if (episode.isSpecial || !episode.seasonNumber) return;
+
+                    var season = seasons[episode.seasonNumber] || (seasons[episode.seasonNumber] = { episodes: [], comments: 0 });
+                    season.episodes.push(episode);
+                    season.comments += episode.commentsCount || 0;
+                });
+
+                var numbers = Object.keys(seasons).map(Number).sort(function (a, b) { return a - b; });
+                if (!numbers.length) return Lampa.Noty.show('MyShows: у сериала нет серий');
+
+                Lampa.Select.show({
+                    title: 'Комментарии MyShows',
+                    items: numbers.map(function (number) {
+                        var season = seasons[number];
+                        return {
+                            title: 'Сезон ' + number,
+                            subtitle: season.episodes.length + ' ' + episodesNominative(season.episodes.length) +
+                                ' · ' + season.comments + ' ' + commentsWord(season.comments),
+                            number: number
+                        };
+                    }),
+                    onSelect: function (chosen) {
+                        var episodes = seasons[chosen.number].episodes.sort(function (a, b) {
+                            return a.episodeNumber - b.episodeNumber;
+                        });
+
+                        showSeasonComments(ctx, show, chosen.number, episodes, back);
+                    },
+                    onBack: function () { Lampa.Controller.toggle(back); }
+                });
+            }, function () {
+                Lampa.Noty.show('MyShows: не удалось получить сериал');
+            });
+        }, function () {
+            Lampa.Noty.show('MyShows: сериал не найден');
+        });
+    }
+
+    // Текст комментария приходит с HTML-сущностями (&quot;). Раскодируем
+    // через DOMParser — он ничего не исполняет, — а вставляем как текст.
+    function plainText(value) {
+        try {
+            return new DOMParser().parseFromString(String(value || ''), 'text/html').documentElement.textContent || '';
+        } catch (e) {
+            return String(value || '');
+        }
+    }
+
+    function topComments(list) {
+        return (list || []).filter(function (comment) {
+            return comment && !comment.isDeleted && !comment.isBad && comment.comment;
+        }).sort(function (a, b) {
+            return (b.rating || 0) - (a.rating || 0);
+        }).slice(0, COMMENTS_TOP);
+    }
+
+    function showSeasonComments(ctx, show, number, episodes, back) {
+        var results = [];
+        var names = {};
+        var waiting = 2;
+
+        Lampa.Noty.show('MyShows: загружаем комментарии…');
+
+        // Названия серий у MyShows только латиницей — русские берём у TMDB
+        tmdbGet('tv/' + ctx.card.id + '/season/' + number, function (season) {
+            ((season && season.episodes) || []).forEach(function (episode) {
+                if (episode.name) names[episode.episode_number] = episode.name;
+            });
+            render();
+        });
+
+        pool(episodes, COMMENTS_WORKERS, function (episode, next) {
+            if (!episode.commentsCount) {
+                results[episodes.indexOf(episode)] = { episode: episode, comments: [] };
+                return next();
+            }
+
+            myshows('shows.EpisodeComments', { episodeId: episode.id }, function (data) {
+                results[episodes.indexOf(episode)] = { episode: episode, comments: topComments(data && data.comments) };
+                next();
+            }, function () {
+                results[episodes.indexOf(episode)] = { episode: episode, comments: [], failed: true };
+                next();
+            });
+        }, render);
+
+        function render() {
+            if (--waiting) return;
+
+            var html = $('<div class="simkl-comments"></div>');
+
+            results.forEach(function (row) {
+                var episode = row.episode;
+                var head = $('<div class="simkl-comments__episode"></div>');
+
+                head.text(episodeCode({ season: number, episode: episode.episodeNumber }) + ' · ' +
+                    (names[episode.episodeNumber] || plainText(episode.title)) + ' ');
+                head.append($('<span class="simkl-comments__count"></span>').text(
+                    (episode.commentsCount || 0) + ' ' + commentsWord(episode.commentsCount || 0)
+                ));
+                html.append(head);
+
+                if (!row.comments.length) {
+                    html.append($('<div class="simkl-comments__empty"></div>').text(
+                        row.failed ? 'не удалось загрузить' : 'комментариев нет'
+                    ));
+                    return;
+                }
+
+                row.comments.forEach(function (comment) {
+                    var item = $('<div class="simkl-comment selector"></div>');
+                    var rating = comment.rating || 0;
+
+                    item.append($('<div class="simkl-comment__meta"></div>').text(
+                        ((comment.user && comment.user.login) || 'аноним') + ' · ' +
+                        formatDate(comment.createdAt) + ' · ' + (rating > 0 ? '+' : '') + rating
+                    ));
+                    item.append($('<div class="simkl-comment__text"></div>').text(plainText(comment.comment)));
+                    html.append(item);
+                });
+            });
+
+            Lampa.Modal.open({
+                title: (Core.cardTitle(ctx.card) || show.title) + ' · сезон ' + number,
+                html: html,
+                size: 'large',
+                onBack: function () {
+                    Lampa.Modal.close();
+                    Lampa.Controller.toggle(back);
+                }
+            });
+        }
     }
 
     // --- Карточки TMDB -----------------------------------------------------
@@ -3974,6 +4224,15 @@
             field: {
                 name: 'Кнопка Simkl',
                 description: 'Кнопка в ряду под постером: отметки о просмотре'
+            }
+        });
+
+        Lampa.SettingsApi.addParam({
+            component: 'simkl',
+            param: { name: COMMENTS_KEY, type: 'trigger', default: true },
+            field: {
+                name: 'Кнопка «Комментарии»',
+                description: 'У сериалов: лучшие комментарии MyShows к сериям выбранного сезона'
             }
         });
 
